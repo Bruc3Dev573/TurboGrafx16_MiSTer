@@ -3,27 +3,44 @@ use IEEE.std_logic_1164.all;
 use ieee.numeric_std.all;
 library work;
 use work.HUC6280_PKG.all;
+use work.pBus_savestates.all;
+use work.pPCE_savestates.all;
 
 entity HUC6280_CPU is
-	port( 
+	port(
 		CLK		: in std_logic;
 		RST_N		: in std_logic;
 		CE			: in std_logic;
-		  
+
 		A_OUT		: out std_logic_vector(20 downto 0);
 		DI			: in std_logic_vector(7 downto 0);
 		DO			: out std_logic_vector(7 downto 0);
 		WE_N  	: out std_logic;
 		RDY		: in std_logic;
-		NMI_N		: in std_logic;  
+		NMI_N		: in std_logic;
 		IRQ1_N	: in std_logic;
 		IRQ2_N	: in std_logic;
 		IRQT_N	: in std_logic;
-		
+
 		VDCNUM	: in std_logic;
 
 		MCYCLE  	: out std_logic;
-		CS  		: out std_logic
+		CS  		: out std_logic;
+
+		-- Savestates (plan §5.1): eRegs CPU_1/CPU_MPR live here; the CPU_2 eReg
+		-- lives in the HUC6280 wrapper (it also packs O/IO_BUF) — this core
+		-- exports its CPU_2 fields pre-placed and takes the restore value back.
+		SaveStateBus_Din  : in  std_logic_vector(63 downto 0) := (others => '0');
+		SaveStateBus_Adr  : in  std_logic_vector(9 downto 0) := (others => '0');
+		SaveStateBus_wren : in  std_logic := '0';
+		SaveStateBus_rst  : in  std_logic := '0';
+		SaveStateBus_load : in  std_logic := '0';
+		SaveStateBus_Dout : out std_logic_vector(63 downto 0);
+		SS_CPU2_PART      : out std_logic_vector(63 downto 0);	-- PCr/MPR_LAST/int latches at final CPU_2 positions
+		SS_CPU2_Din       : in  std_logic_vector(63 downto 0) := (others => '0');	-- wrapper CPU_2 eReg value
+		-- Composite safe-boundary status (plan §2.3)
+		SS_STATE0         : out std_logic;
+		SS_RES_INT        : out std_logic
 	);
 end HUC6280_CPU;
 
@@ -83,6 +100,15 @@ architecture rtl of HUC6280_CPU is
 	signal OLD_NMI_N 		: std_logic;
 	signal NMI_SYNC 		: std_logic;
 	signal NMI_ACTIVE 	: std_logic;
+
+	--Savestates
+	signal CS_FF			: std_logic;
+	signal SS_CPU_1		: std_logic_vector(63 downto 0);
+	signal SS_MPR			: std_logic_vector(63 downto 0);
+	signal SS_CPU_1_BACK	: std_logic_vector(63 downto 0) := (others => '0');
+	signal SS_MPR_BACK	: std_logic_vector(63 downto 0);
+	signal SS_Dout_1		: std_logic_vector(63 downto 0);
+	signal SS_Dout_MPR	: std_logic_vector(63 downto 0);
 
 begin
 	
@@ -161,12 +187,15 @@ begin
 			IR <= (others=>'0');
 			STATE <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				IR    <= SS_CPU_1(47 downto 40);
+				STATE <= unsigned(SS_CPU_1(52 downto 48));
+			elsif EN = '1' then
 				IR <= NEXT_IR;
 				STATE <= NEXT_STATE;
 			end if;
 		end if;
-	end process; 
+	end process;
 
 	LAST_CYCLE <= '1' when NEXT_STATE = "00000" else '0';
 	
@@ -259,17 +288,21 @@ begin
 			X <= (others=>'0');
 			Y <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				A <= SS_CPU_1(7 downto 0);
+				X <= SS_CPU_1(15 downto 8);
+				Y <= SS_CPU_1(23 downto 16);
+			elsif EN = '1' then
 				if MC.AXY_CTRL(0) = '1' then
 					A <= ALU_OUT;
-				end if; 
+				end if;
 				if MC.AXY_CTRL(1) = '1' then
 					X <= ALU_OUT;
-				end if; 
+				end if;
 				if MC.AXY_CTRL(2) = '1' then
 					Y <= ALU_OUT;
-				end if; 
-			end if; 
+				end if;
+			end if;
 		end if;
 	end process;
 				  
@@ -295,7 +328,9 @@ begin
 		if RST_N = '0' then
 			SP <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				SP <= SS_CPU_1(31 downto 24);
+			elsif EN = '1' then
 				case MC.LOAD_SP is
 					when "001" => 
 						SP <= ALU_OUT;
@@ -315,7 +350,9 @@ begin
 		if RST_N = '0' then
 			P <= "00000100";
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				P <= SS_CPU_1(39 downto 32);
+			elsif EN = '1' then
 				case MC.LOAD_P is
 					when "001" =>  -- ALU
 						P(FLAG_Z) <= ZO; 
@@ -382,7 +419,12 @@ begin
 			MPR(6) <= (others=>'0');
 			MPR(7) <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				for i in 0 to 7 loop
+					MPR(i) <= SS_MPR(i*8+7 downto i*8);
+				end loop;
+				MPR_LAST <= SS_CPU2_Din(23 downto 16);
+			elsif EN = '1' then
 				if IR = x"53" and LAST_CYCLE = '1' then	--TAMi
 					for i in 0 to 7 loop
 						if T(i) = '1' then
@@ -447,8 +489,10 @@ begin
 		X     		=> X, 
 		Y     		=> Y, 
 		DR    		=> DR,
-		PC     		=> PC, 
-		AA     		=> AA
+		PC     		=> PC,
+		AA     		=> AA,
+		SS_PC_load	=> SaveStateBus_load,
+		SS_PC			=> SS_CPU2_Din(15 downto 0)
 	);
 	
 	--Interrupts
@@ -458,7 +502,10 @@ begin
 			OLD_NMI_N <= '1';
 			NMI_SYNC <= '0';
 		elsif rising_edge(CLK) then
-			if RES_INT = '0' then
+			if SaveStateBus_load = '1' then
+				OLD_NMI_N <= SS_CPU2_Din(46);
+				NMI_SYNC  <= SS_CPU2_Din(47);
+			elsif RES_INT = '0' then
 				OLD_NMI_N <= NMI_N;
 				if NMI_N = '0' and OLD_NMI_N = '1' and NMI_SYNC = '0' then
 					NMI_SYNC <= '1';
@@ -480,7 +527,15 @@ begin
 			GOT_INT <= '1';
 			NMI_ACTIVE <= '0';
 		elsif rising_edge(CLK) then
-			if RDY = '1' and CE = '1' then
+			if SaveStateBus_load = '1' then
+				GOT_INT    <= SS_CPU2_Din(40);
+				RES_INT    <= SS_CPU2_Din(41);
+				NMI_INT    <= SS_CPU2_Din(42);
+				IRQ1_INT   <= SS_CPU2_Din(43);
+				IRQ2_INT   <= SS_CPU2_Din(44);
+				IRQT_INT   <= SS_CPU2_Din(45);
+				NMI_ACTIVE <= SS_CPU2_Din(48);
+			elsif RDY = '1' and CE = '1' then
 				NMI_ACTIVE <= NMI_SYNC;
 				
 				if LAST_CYCLE = '1' and EN = '1' then
@@ -555,17 +610,93 @@ begin
 	process(CLK, RST_N)
 	begin
 		if RST_N = '0' then
-			CS <= '0';
+			CS_FF <= '0';
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				CS_FF <= SS_CPU_1(53);
+			elsif EN = '1' then
 				if IR(6 downto 0) = "1010100" and STATE = "00001" then
-					CS <= IR(7);
-				end if; 
-			end if; 
+					CS_FF <= IR(7);
+				end if;
+			end if;
 		end if;
 	end process;
-	
+
+	CS <= CS_FF;
+
 	MCYCLE <= MC.MEM_CYCLE;
-	
+
+	--------------------------------------------------------------------------------
+	-- SAVESTATES (plan §5.1; slot map: pce_savestates_pkg.vhd)
+	--------------------------------------------------------------------------------
+	-- NOT saved (reconstructed, gate STATE=0): MI (== fetch microcode at any
+	-- STATE=0 boundary and at reset), T, DR, SH, DH, LH, AA/AAL/AAH,
+	-- SavedCarry (AG), SavedC (ALU), TALT, CPU_DI.  reset_ss zeroes them.
+
+	-- CPU_1: A(7:0), X(15:8), Y(23:16), SP(31:24), P(39:32), IR(47:40),
+	--        STATE(52:48), CS(53)
+	SS_CPU_1_BACK(7 downto 0)   <= A;
+	SS_CPU_1_BACK(15 downto 8)  <= X;
+	SS_CPU_1_BACK(23 downto 16) <= Y;
+	SS_CPU_1_BACK(31 downto 24) <= SP;
+	SS_CPU_1_BACK(39 downto 32) <= P;
+	SS_CPU_1_BACK(47 downto 40) <= IR;
+	SS_CPU_1_BACK(52 downto 48) <= std_logic_vector(STATE);
+	SS_CPU_1_BACK(53)           <= CS_FF;
+
+	-- CPU_MPR: MPR0(7:0) .. MPR7(63:56)
+	GEN_MPR_BACK : for i in 0 to 7 generate
+		SS_MPR_BACK(i*8+7 downto i*8) <= MPR(i);
+	end generate;
+
+	-- CPU_2 fields owned here, pre-placed at their final bit positions
+	-- (the wrapper ORs in O(31:24) and IO_BUF(39:32) and owns the eReg):
+	SS_CPU2_PART(15 downto 0)  <= PC;
+	SS_CPU2_PART(23 downto 16) <= MPR_LAST;
+	SS_CPU2_PART(31 downto 24) <= (others => '0');	-- O (wrapper)
+	SS_CPU2_PART(39 downto 32) <= (others => '0');	-- IO_BUF (wrapper)
+	SS_CPU2_PART(40)           <= GOT_INT;
+	SS_CPU2_PART(41)           <= RES_INT;
+	SS_CPU2_PART(42)           <= NMI_INT;
+	SS_CPU2_PART(43)           <= IRQ1_INT;
+	SS_CPU2_PART(44)           <= IRQ2_INT;
+	SS_CPU2_PART(45)           <= IRQT_INT;
+	SS_CPU2_PART(46)           <= OLD_NMI_N;
+	SS_CPU2_PART(47)           <= NMI_SYNC;
+	SS_CPU2_PART(48)           <= NMI_ACTIVE;
+	SS_CPU2_PART(63 downto 49) <= (others => '0');
+
+	iSS_CPU_1 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CPU_1, def => SSREG_DEFAULT_CPU_1 )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_1,
+		Din      => SS_CPU_1_BACK,
+		Dout     => SS_CPU_1
+	);
+
+	iSS_CPU_MPR : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CPU_MPR, def => SSREG_DEFAULT_CPU_MPR )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_MPR,
+		Din      => SS_MPR_BACK,
+		Dout     => SS_MPR
+	);
+
+	SaveStateBus_Dout <= SS_Dout_1 or SS_Dout_MPR;
+
+	-- Composite boundary status (plan §2.3)
+	SS_STATE0  <= '1' when STATE = "00000" else '0';
+	SS_RES_INT <= RES_INT;
+
 end rtl;
 	

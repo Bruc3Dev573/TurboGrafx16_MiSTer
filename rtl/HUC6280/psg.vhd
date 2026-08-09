@@ -2,6 +2,9 @@ library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.STD_LOGIC_UNSIGNED.ALL;
 use IEEE.NUMERIC_STD.ALL;
+library work;
+use work.pBus_savestates.all;
+use work.pPCE_savestates.all;
 
 entity psg is
 	port (
@@ -17,7 +20,21 @@ entity psg is
 		-- DAC Interface
 		DAC_LATCH	: in std_logic;
 		LDATA		: out std_logic_vector(23 downto 0);
-		RDATA		: out std_logic_vector(23 downto 0)
+		RDATA		: out std_logic_vector(23 downto 0);
+
+		-- Savestates (plan §5.2)
+		SaveStateBus_Din  : in  std_logic_vector(63 downto 0) := (others => '0');
+		SaveStateBus_Adr  : in  std_logic_vector(9 downto 0) := (others => '0');
+		SaveStateBus_wren : in  std_logic := '0';
+		SaveStateBus_rst  : in  std_logic := '0';
+		SaveStateBus_load : in  std_logic := '0';
+		SaveStateBus_Dout : out std_logic_vector(63 downto 0);
+		-- WF_DATA walk (SAVETYPE_PSGWF): addr[7:5]=channel, addr[4:0]=entry.
+		-- The SS write path BYPASSES the DDA=0 gate of the CPU write path.
+		SS_WF_Addr        : in  std_logic_vector(7 downto 0) := (others => '0');
+		SS_WF_WrEn        : in  std_logic := '0';
+		SS_WF_WrData      : in  std_logic_vector(4 downto 0) := (others => '0');
+		SS_WF_RdData      : out std_logic_vector(4 downto 0)
 	);
 end psg;
 
@@ -87,6 +104,15 @@ signal MIX_CNT	: std_logic_vector(2 downto 0);
 signal LDATA_FF	: std_logic_vector(23 downto 0);
 signal RDATA_FF	: std_logic_vector(23 downto 0);
 
+-- Savestates
+type slv64_array6 is array(0 to 5) of std_logic_vector(63 downto 0);
+signal SS_GLOBAL      : std_logic_vector(63 downto 0);
+signal SS_GLOBAL_BACK : std_logic_vector(63 downto 0) := (others => '0');
+signal SS_Dout_GLOBAL : std_logic_vector(63 downto 0);
+signal SS_CH_A,      SS_CH_B,      SS_CH_C      : slv64_array6;
+signal SS_CH_A_BACK, SS_CH_B_BACK, SS_CH_C_BACK : slv64_array6 := (others => (others => '0'));
+signal SS_Dout_A,    SS_Dout_B,    SS_Dout_C    : slv64_array6;
+
 begin
 
 -- CPU Interface
@@ -118,7 +144,30 @@ begin
 				CH(i).LFCTL <= "00";
 				CH(i).LFTRG <= '0';
 			end loop;
+		elsif SaveStateBus_load = '1' then
+			-- Savestate restore (registers driven by this process)
+			CHSEL <= conv_integer(SS_GLOBAL(2 downto 0));
+			LMAL  <= SS_GLOBAL(7 downto 4);
+			RMAL  <= SS_GLOBAL(11 downto 8);
+			for i in 0 to 5 loop
+				CH(i).FREQ     <= SS_CH_A(i)(11 downto 0);
+				CH(i).DDA      <= SS_CH_A(i)(12);
+				CH(i).CHON     <= SS_CH_A(i)(13);
+				CH(i).AL       <= SS_CH_A(i)(20 downto 16);
+				CH(i).LAL      <= SS_CH_A(i)(27 downto 24);
+				CH(i).RAL      <= SS_CH_A(i)(31 downto 28);
+				CH(i).NG_FREQ  <= SS_CH_A(i)(36 downto 32);
+				CH(i).NE       <= SS_CH_A(i)(37);
+				CH(i).DA_OUT   <= SS_CH_A(i)(52 downto 48);
+				CH(i).LFO_FREQ <= SS_CH_C(i)(7 downto 0);
+				CH(i).LFCTL    <= SS_CH_C(i)(9 downto 8);
+				CH(i).LFTRG    <= SS_CH_C(i)(10);
+			end loop;
 		else
+			-- WF_DATA walk write (freeze only; bypasses the DDA=0 gate)
+			if SS_WF_WrEn = '1' then
+				CH(conv_integer(SS_WF_Addr(7 downto 5))).WF_DATA(conv_integer(SS_WF_Addr(4 downto 0))) <= SS_WF_WrData;
+			end if;
 			if WE = '1' then
 				case A is
 				when "0000" =>
@@ -187,6 +236,16 @@ process( CLK ) begin
 				CH(i).LFSR <= (others => '0');
 				CH(i).NG_CNT <= (others => '0');
 				CH(i).LFO_CNT <= (others => '0');
+			elsif SaveStateBus_load = '1' then
+				-- Savestate restore (registers driven by this process)
+				CH(i).WF_ADDR <= SS_CH_A(i)(44 downto 40);
+				CH(i).WF_OUT  <= SS_CH_A(i)(60 downto 56);
+				CH(i).WF_CNT  <= SS_CH_B(i)(12 downto 0);
+				CH(i).LFSR    <= SS_CH_B(i)(33 downto 16);
+				CH(i).NG_CNT  <= SS_CH_B(i)(47 downto 36);
+				CH(i).NG_OUT  <= SS_CH_B(i)(52 downto 48);
+				CH(i).GL_OUT  <= SS_CH_B(i)(60 downto 56);
+				CH(i).LFO_CNT <= SS_CH_C(i)(23 downto 16);
 			else
 				if CH(i).WF_RES = '1' then
 					CH(i).WF_ADDR <= (others => '0');
@@ -281,6 +340,10 @@ begin
 			for i in 0 to 5 loop
 				CH(i).LFO_ADD <= (others => '0');
 			end loop;
+		elsif SaveStateBus_load = '1' then
+			for i in 0 to 5 loop
+				CH(i).LFO_ADD <= SS_CH_C(i)(43 downto 32);
+			end loop;
 		else
 			DATA := CH(1).WF_DATA(conv_integer(CH(1).WF_ADDR)) xor "1000";
 			CH(0).LFO_ADD(11 downto 8) <= DATA(4) & DATA(4) & DATA(4) & DATA(4);
@@ -309,6 +372,12 @@ begin
 			LDATA_FF <= (others => '0');
 			RDATA_FF <= (others => '0');
 			MIX <= MIX_WAIT;
+		elsif SaveStateBus_load = '1' then
+			-- Savestate restore. The mixer FSM itself is NOT saved: it free-runs
+			-- and self-reconstructs in ~13 cycles; LDATA_FF/RDATA_FF cover the
+			-- DAC latch meanwhile (plan §5.2 rationale).
+			LDATA_FF <= SS_GLOBAL(35 downto 12);
+			RDATA_FF <= SS_GLOBAL(59 downto 36);
 		else
 			case MIX is
 			when MIX_WAIT =>
@@ -359,6 +428,122 @@ end process;
 
 LDATA <= LDATA_FF;
 RDATA <= RDATA_FF;
+
+--------------------------------------------------------------------------------
+-- SAVESTATES (plan §5.2; slot map: pce_savestates_pkg.vhd)
+--------------------------------------------------------------------------------
+-- NOT saved: LACC/RACC/VT_ADDR/VT_DATA/MIX/MIX_CNT (mixer self-reconstructs),
+-- WF_RES/WF_INC (single-cycle strobes), voltab (constant dpram).
+
+-- WF_DATA walk read (async mux over the flop array).  The address bus is
+-- shared with the other Save_RAM regions, whose larger addresses would index
+-- channels 6/7: clamp to a valid channel (result only sampled for type PSGWF).
+process( SS_WF_Addr, CH )
+	variable c : integer range 0 to 7;
+begin
+	c := conv_integer(SS_WF_Addr(7 downto 5));
+	if c > 5 then
+		c := 0;
+	end if;
+	SS_WF_RdData <= CH(c).WF_DATA(conv_integer(SS_WF_Addr(4 downto 0)));
+end process;
+
+-- PSG_GLOBAL: CHSEL(2:0), LMAL(7:4), RMAL(11:8), LDATA_FF(35:12), RDATA_FF(59:36)
+SS_GLOBAL_BACK(2 downto 0)   <= std_logic_vector(to_unsigned(CHSEL, 3));
+SS_GLOBAL_BACK(7 downto 4)   <= LMAL;
+SS_GLOBAL_BACK(11 downto 8)  <= RMAL;
+SS_GLOBAL_BACK(35 downto 12) <= LDATA_FF;
+SS_GLOBAL_BACK(59 downto 36) <= RDATA_FF;
+
+iSS_PSG_GLOBAL : entity work.eReg_SavestateV
+generic map ( Adr => SSREG_INDEX_PSG_GLOBAL, def => SSREG_DEFAULT_PSG_GLOBAL )
+port map (
+	clk      => CLK,
+	BUS_Din  => SaveStateBus_Din,
+	BUS_Adr  => SaveStateBus_Adr,
+	BUS_wren => SaveStateBus_wren,
+	BUS_rst  => SaveStateBus_rst,
+	BUS_Dout => SS_Dout_GLOBAL,
+	Din      => SS_GLOBAL_BACK,
+	Dout     => SS_GLOBAL
+);
+
+GEN_SS_CH : for i in 0 to 5 generate
+	-- CHx_A: FREQ(11:0), DDA(12), CHON(13), AL(20:16), LAL(27:24), RAL(31:28),
+	--        NG_FREQ(36:32), NE(37), WF_ADDR(44:40), DA_OUT(52:48), WF_OUT(60:56)
+	SS_CH_A_BACK(i)(11 downto 0)  <= CH(i).FREQ;
+	SS_CH_A_BACK(i)(12)           <= CH(i).DDA;
+	SS_CH_A_BACK(i)(13)           <= CH(i).CHON;
+	SS_CH_A_BACK(i)(20 downto 16) <= CH(i).AL;
+	SS_CH_A_BACK(i)(27 downto 24) <= CH(i).LAL;
+	SS_CH_A_BACK(i)(31 downto 28) <= CH(i).RAL;
+	SS_CH_A_BACK(i)(36 downto 32) <= CH(i).NG_FREQ;
+	SS_CH_A_BACK(i)(37)           <= CH(i).NE;
+	SS_CH_A_BACK(i)(44 downto 40) <= CH(i).WF_ADDR;
+	SS_CH_A_BACK(i)(52 downto 48) <= CH(i).DA_OUT;
+	SS_CH_A_BACK(i)(60 downto 56) <= CH(i).WF_OUT;
+
+	-- CHx_B: WF_CNT(12:0), LFSR(33:16), NG_CNT(47:36), NG_OUT(52:48), GL_OUT(60:56)
+	SS_CH_B_BACK(i)(12 downto 0)  <= CH(i).WF_CNT;
+	SS_CH_B_BACK(i)(33 downto 16) <= CH(i).LFSR;
+	SS_CH_B_BACK(i)(47 downto 36) <= CH(i).NG_CNT;
+	SS_CH_B_BACK(i)(52 downto 48) <= CH(i).NG_OUT;
+	SS_CH_B_BACK(i)(60 downto 56) <= CH(i).GL_OUT;
+
+	-- CHx_C: LFO_FREQ(7:0), LFCTL(9:8), LFTRG(10), LFO_CNT(23:16), LFO_ADD(43:32)
+	SS_CH_C_BACK(i)(7 downto 0)   <= CH(i).LFO_FREQ;
+	SS_CH_C_BACK(i)(9 downto 8)   <= CH(i).LFCTL;
+	SS_CH_C_BACK(i)(10)           <= CH(i).LFTRG;
+	SS_CH_C_BACK(i)(23 downto 16) <= CH(i).LFO_CNT;
+	SS_CH_C_BACK(i)(43 downto 32) <= CH(i).LFO_ADD;
+
+	iSS_CH_A : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_PSG_CH0 + i*3, def => SSREG_DEFAULT_PSG_CH )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_A(i),
+		Din      => SS_CH_A_BACK(i),
+		Dout     => SS_CH_A(i)
+	);
+
+	iSS_CH_B : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_PSG_CH0 + i*3 + 1, def => SSREG_DEFAULT_PSG_CH )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_B(i),
+		Din      => SS_CH_B_BACK(i),
+		Dout     => SS_CH_B(i)
+	);
+
+	iSS_CH_C : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_PSG_CH0 + i*3 + 2, def => SSREG_DEFAULT_PSG_CH )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_C(i),
+		Din      => SS_CH_C_BACK(i),
+		Dout     => SS_CH_C(i)
+	);
+end generate;
+
+SaveStateBus_Dout <= SS_Dout_GLOBAL
+	or SS_Dout_A(0) or SS_Dout_B(0) or SS_Dout_C(0)
+	or SS_Dout_A(1) or SS_Dout_B(1) or SS_Dout_C(1)
+	or SS_Dout_A(2) or SS_Dout_B(2) or SS_Dout_C(2)
+	or SS_Dout_A(3) or SS_Dout_B(3) or SS_Dout_C(3)
+	or SS_Dout_A(4) or SS_Dout_B(4) or SS_Dout_C(4)
+	or SS_Dout_A(5) or SS_Dout_B(5) or SS_Dout_C(5);
 
 end rtl;
 

@@ -15,7 +15,13 @@ entity MSM5205 is
 		VCK_R		: out std_logic;
 		VCK_F		: out std_logic;
 		
-		SOUT		: out signed(15 downto 0)
+		SOUT		: out signed(15 downto 0);
+
+		-- Savestates (owned by cd.vhd's CD_4 slot): export/restore
+		SLEEP		: in std_logic := '0';
+		SS_load	: in std_logic := '0';
+		SS_DIN	: in std_logic_vector(38 downto 0) := (others => '0');
+		SS_DOUT	: out std_logic_vector(38 downto 0)
 	);
 end MSM5205;
 
@@ -77,9 +83,14 @@ architecture rtl of MSM5205 is
 	constant SIT : StepIndexTable_t := ("0010","0100","0110","1000");
 	
 	 
-	signal CLK_CNT    : unsigned(5 downto 0);
-	signal SAMPLE_RCE : std_logic;
-	signal SAMPLE_FCE : std_logic;
+	-- CLK_CNT is never cleared by RST_N (only wrapped at 48), so without an
+	-- initial value it stays 'U' for the whole simulation: the VCK pulses never
+	-- fire and the decoder looks dead in a testbench even though it runs on real
+	-- hardware (FPGA registers power up at 0).  Initialising it makes simulation
+	-- match the device and is what Quartus infers anyway.
+	signal CLK_CNT    : unsigned(5 downto 0) := (others => '0');
+	signal SAMPLE_RCE : std_logic := '0';
+	signal SAMPLE_FCE : std_logic := '0';
 	 
 	signal DEC_DATA   : unsigned(3 downto 0);
 	signal DEC_EXEC   : std_logic;
@@ -94,6 +105,9 @@ begin
 		if rising_edge(CLK) then
 			SAMPLE_RCE <= '0';
 			SAMPLE_FCE <= '0';
+			if SS_load = '1' then
+				CLK_CNT <= unsigned(SS_DIN(37 downto 32));
+			elsif SLEEP = '0' then
 			if XTI = '1' then
 				CLK_CNT <= CLK_CNT + 1;
 				if CLK_CNT = 24-1 then
@@ -104,6 +118,7 @@ begin
 					SAMPLE_FCE <= '1';
 				end if;
 			end if;
+			end if;	-- savestate load / SLEEP
 		end if;
 	end process;
 	
@@ -122,6 +137,12 @@ begin
 			SAMPLE <= x"0000";
 		elsif rising_edge(CLK) then
 			DEC_EXEC <= '0';
+			if SS_load = '1' then
+				SAMPLE   <= unsigned(SS_DIN(15 downto 0));
+				STEP     <= unsigned(SS_DIN(21 downto 16));
+				DEC_DATA <= unsigned(SS_DIN(27 downto 24));
+				DEC_EXEC <= SS_DIN(28);
+			elsif SLEEP = '0' then
 			if SAMPLE_FCE = '1' then
 				DEC_DATA <= unsigned(D);
 				DEC_EXEC <= '1';
@@ -157,9 +178,20 @@ begin
 					STEP <= NEXT_STEP(5 downto 0);
 				end if;
 			end if;
+			end if;	-- savestate load / SLEEP
 		end if;
 	end process;
 	
 	SOUT <= signed(SAMPLE(11 downto 0)) & x"0";
+
+	-- Savestate export (CD_4 layout, bits relative to slot: 38:0 here)
+	SS_DOUT(15 downto 0)  <= std_logic_vector(SAMPLE);
+	SS_DOUT(21 downto 16) <= std_logic_vector(STEP);
+	SS_DOUT(23 downto 22) <= (others => '0');
+	SS_DOUT(27 downto 24) <= std_logic_vector(DEC_DATA);
+	SS_DOUT(28)           <= DEC_EXEC;
+	SS_DOUT(31 downto 29) <= (others => '0');
+	SS_DOUT(37 downto 32) <= std_logic_vector(CLK_CNT);
+	SS_DOUT(38)           <= '0';
 
 end rtl;

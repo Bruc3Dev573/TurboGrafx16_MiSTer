@@ -17,6 +17,7 @@ module MB128
 
 	output        o_Active,
 	output  [3:0] o_Data,
+	output        o_Idle,     // savestate boundary veto: high when the serial FSM is idle
 
 	input	        bk_clk,
 	input  [15:0] bk_address,
@@ -214,5 +215,7 @@ end
 
 assign o_Active = r_State != STATE_IDLE;
 assign o_Data = r_Data;
+
+assign o_Idle = (r_State == STATE_IDLE);
 
 endmodule

@@ -17,7 +17,11 @@ entity HUC6280_AG is
 		  DR   			: in std_logic_vector(7 downto 0);
 
 		  PC				: out std_logic_vector(15 downto 0);
-        AA     		: out std_logic_vector(15 downto 0)
+        AA     		: out std_logic_vector(15 downto 0);
+
+		  -- Savestates: PCr restore (save path uses the PC output)
+		  SS_PC_load	: in std_logic := '0';
+		  SS_PC			: in std_logic_vector(15 downto 0) := (others => '0')
     );
 end HUC6280_AG;
 
@@ -62,7 +66,9 @@ begin
 		if RST_N = '0' then
 			PCr <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if CE = '1' then
+			if SS_PC_load = '1' then
+				PCr <= SS_PC;	-- savestate restore (CE frozen)
+			elsif CE = '1' then
 				PCr <= NextPC;
 			end if;
 		end if;
