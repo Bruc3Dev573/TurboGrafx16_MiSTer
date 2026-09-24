@@ -3,6 +3,8 @@ use IEEE.std_logic_1164.all;
 use ieee.numeric_std.all;
 library work;
 use work.HUC6280_PKG.all;
+use work.pBus_savestates.all;
+use work.pPCE_savestates.all;
 
 entity HUC6280_CPU is
 	port( 
@@ -23,7 +25,18 @@ entity HUC6280_CPU is
 		VDCNUM	: in std_logic;
 
 		MCYCLE  	: out std_logic;
-		CS  		: out std_logic
+		CS  		: out std_logic;
+
+		-- Savestates: CPU_1/CPU_MPR eRegs live here; the CPU_2 eReg is owned by the HUC6280 wrapper
+		SaveStateBus_Din  : in  std_logic_vector(63 downto 0) := (others => '0');
+		SaveStateBus_Adr  : in  std_logic_vector(9 downto 0) := (others => '0');
+		SaveStateBus_wren : in  std_logic := '0';
+		SaveStateBus_rst  : in  std_logic := '0';
+		SaveStateBus_load : in  std_logic := '0';
+		SaveStateBus_Dout : out std_logic_vector(63 downto 0);
+		SS_CPU2_PART      : out std_logic_vector(63 downto 0);	-- PCr/MPR_LAST/int latches at final CPU_2 positions
+		SS_CPU2_Din       : in  std_logic_vector(63 downto 0) := (others => '0');	-- wrapper CPU_2 eReg value
+		SS_IDLE           : out std_logic	-- STATE=0 and no pending reset: safe boundary
 	);
 end HUC6280_CPU;
 
@@ -83,6 +96,15 @@ architecture rtl of HUC6280_CPU is
 	signal OLD_NMI_N 		: std_logic;
 	signal NMI_SYNC 		: std_logic;
 	signal NMI_ACTIVE 	: std_logic;
+
+	--Savestates
+	signal CS_FF			: std_logic;
+	signal SS_CPU_1		: std_logic_vector(63 downto 0);
+	signal SS_MPR			: std_logic_vector(63 downto 0);
+	signal SS_CPU_1_BACK	: std_logic_vector(63 downto 0) := (others => '0');
+	signal SS_MPR_BACK	: std_logic_vector(63 downto 0);
+	signal SS_Dout_1		: std_logic_vector(63 downto 0);
+	signal SS_Dout_MPR	: std_logic_vector(63 downto 0);
 
 begin
 	
@@ -161,7 +183,10 @@ begin
 			IR <= (others=>'0');
 			STATE <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				IR    <= SS_CPU_1(47 downto 40);
+				STATE <= unsigned(SS_CPU_1(52 downto 48));
+			elsif EN = '1' then
 				IR <= NEXT_IR;
 				STATE <= NEXT_STATE;
 			end if;
@@ -259,7 +284,11 @@ begin
 			X <= (others=>'0');
 			Y <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				A <= SS_CPU_1(7 downto 0);
+				X <= SS_CPU_1(15 downto 8);
+				Y <= SS_CPU_1(23 downto 16);
+			elsif EN = '1' then
 				if MC.AXY_CTRL(0) = '1' then
 					A <= ALU_OUT;
 				end if; 
@@ -295,7 +324,9 @@ begin
 		if RST_N = '0' then
 			SP <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				SP <= SS_CPU_1(31 downto 24);
+			elsif EN = '1' then
 				case MC.LOAD_SP is
 					when "001" => 
 						SP <= ALU_OUT;
@@ -315,7 +346,9 @@ begin
 		if RST_N = '0' then
 			P <= "00000100";
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				P <= SS_CPU_1(39 downto 32);
+			elsif EN = '1' then
 				case MC.LOAD_P is
 					when "001" =>  -- ALU
 						P(FLAG_Z) <= ZO; 
@@ -382,7 +415,12 @@ begin
 			MPR(6) <= (others=>'0');
 			MPR(7) <= (others=>'0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				for i in 0 to 7 loop
+					MPR(i) <= SS_MPR(i*8+7 downto i*8);
+				end loop;
+				MPR_LAST <= SS_CPU2_Din(23 downto 16);
+			elsif EN = '1' then
 				if IR = x"53" and LAST_CYCLE = '1' then	--TAMi
 					for i in 0 to 7 loop
 						if T(i) = '1' then
@@ -448,7 +486,9 @@ begin
 		Y     		=> Y, 
 		DR    		=> DR,
 		PC     		=> PC, 
-		AA     		=> AA
+		AA     		=> AA,
+		SS_PC_load	=> SaveStateBus_load,
+		SS_PC			=> SS_CPU2_Din(15 downto 0)
 	);
 	
 	--Interrupts
@@ -458,7 +498,10 @@ begin
 			OLD_NMI_N <= '1';
 			NMI_SYNC <= '0';
 		elsif rising_edge(CLK) then
-			if RES_INT = '0' then
+			if SaveStateBus_load = '1' then
+				OLD_NMI_N <= SS_CPU2_Din(46);
+				NMI_SYNC  <= SS_CPU2_Din(47);
+			elsif RES_INT = '0' then
 				OLD_NMI_N <= NMI_N;
 				if NMI_N = '0' and OLD_NMI_N = '1' and NMI_SYNC = '0' then
 					NMI_SYNC <= '1';
@@ -480,7 +523,15 @@ begin
 			GOT_INT <= '1';
 			NMI_ACTIVE <= '0';
 		elsif rising_edge(CLK) then
-			if RDY = '1' and CE = '1' then
+			if SaveStateBus_load = '1' then
+				GOT_INT    <= SS_CPU2_Din(40);
+				RES_INT    <= SS_CPU2_Din(41);
+				NMI_INT    <= SS_CPU2_Din(42);
+				IRQ1_INT   <= SS_CPU2_Din(43);
+				IRQ2_INT   <= SS_CPU2_Din(44);
+				IRQT_INT   <= SS_CPU2_Din(45);
+				NMI_ACTIVE <= SS_CPU2_Din(48);
+			elsif RDY = '1' and CE = '1' then
 				NMI_ACTIVE <= NMI_SYNC;
 				
 				if LAST_CYCLE = '1' and EN = '1' then
@@ -555,17 +606,83 @@ begin
 	process(CLK, RST_N)
 	begin
 		if RST_N = '0' then
-			CS <= '0';
+			CS_FF <= '0';
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				CS_FF <= SS_CPU_1(53);
+			elsif EN = '1' then
 				if IR(6 downto 0) = "1010100" and STATE = "00001" then
-					CS <= IR(7);
+					CS_FF <= IR(7);
 				end if; 
 			end if; 
 		end if;
 	end process;
 	
+	CS <= CS_FF;
+
 	MCYCLE <= MC.MEM_CYCLE;
+
+	-- Savestates
+	-- Not saved (rebuilt from a STATE=0 boundary, zeroed by reset_ss): MI, T, DR,
+	-- SH, DH, LH, AA/AAL/AAH, SavedCarry, SavedC, TALT, CPU_DI.
+
+	SS_CPU_1_BACK(7 downto 0)   <= A;
+	SS_CPU_1_BACK(15 downto 8)  <= X;
+	SS_CPU_1_BACK(23 downto 16) <= Y;
+	SS_CPU_1_BACK(31 downto 24) <= SP;
+	SS_CPU_1_BACK(39 downto 32) <= P;
+	SS_CPU_1_BACK(47 downto 40) <= IR;
+	SS_CPU_1_BACK(52 downto 48) <= std_logic_vector(STATE);
+	SS_CPU_1_BACK(53)           <= CS_FF;
+
+	GEN_MPR_BACK : for i in 0 to 7 generate
+		SS_MPR_BACK(i*8+7 downto i*8) <= MPR(i);
+	end generate;
+
+	SS_CPU2_PART(15 downto 0)  <= PC;
+	SS_CPU2_PART(23 downto 16) <= MPR_LAST;
+	SS_CPU2_PART(31 downto 24) <= (others => '0');	-- O (wrapper)
+	SS_CPU2_PART(39 downto 32) <= (others => '0');	-- IO_BUF (wrapper)
+	SS_CPU2_PART(40)           <= GOT_INT;
+	SS_CPU2_PART(41)           <= RES_INT;
+	SS_CPU2_PART(42)           <= NMI_INT;
+	SS_CPU2_PART(43)           <= IRQ1_INT;
+	SS_CPU2_PART(44)           <= IRQ2_INT;
+	SS_CPU2_PART(45)           <= IRQT_INT;
+	SS_CPU2_PART(46)           <= OLD_NMI_N;
+	SS_CPU2_PART(47)           <= NMI_SYNC;
+	SS_CPU2_PART(48)           <= NMI_ACTIVE;
+	SS_CPU2_PART(63 downto 49) <= (others => '0');
+
+	iSS_CPU_1 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CPU_1, def => SSREG_DEFAULT_CPU_1 )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_1,
+		Din      => SS_CPU_1_BACK,
+		Dout     => SS_CPU_1
+	);
+
+	iSS_CPU_MPR : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CPU_MPR, def => SSREG_DEFAULT_CPU_MPR )
+	port map (
+		clk      => CLK,
+		BUS_Din  => SaveStateBus_Din,
+		BUS_Adr  => SaveStateBus_Adr,
+		BUS_wren => SaveStateBus_wren,
+		BUS_rst  => SaveStateBus_rst,
+		BUS_Dout => SS_Dout_MPR,
+		Din      => SS_MPR_BACK,
+		Dout     => SS_MPR
+	);
+
+	SaveStateBus_Dout <= SS_Dout_1 or SS_Dout_MPR;
+
+	SS_IDLE <= '1' when STATE = "00000" and RES_INT = '0' else '0';
 	
 end rtl;
 	
