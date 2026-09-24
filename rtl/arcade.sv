@@ -20,16 +20,23 @@ module ARCADE_CARD
 (
 	input         CLK,
 	input         RST_N,
+	input         SLEEP,
+	input  [63:0] SaveStateBus_Din,
+	input   [9:0] SaveStateBus_Adr,
+	input         SaveStateBus_wren,
+	input         SaveStateBus_rst,
+	input         SaveStateBus_load,
+	output [63:0] SaveStateBus_Dout,
 
 	input         EN,
 	input         WR_N,
 	input         RD_N,
 	input  [20:0] A,
 	input   [7:0] DI,
-	output  [7:0] DO,
+	output reg [7:0] DO,
 	output        SEL_N,
 	
-	output        RAM_CS_N,
+	output reg    RAM_CS_N,
 	output [20:0] RAM_A
 );
 
@@ -44,12 +51,33 @@ typedef struct packed
 } port_t;
 
 port_t port[4];
-wire [1:0] p;
+reg [1:0] p;
 
 reg        ena;
 reg [31:0] shift_latch;
 reg  [7:0] shift_bits;
 reg  [7:0] rotate_bits;
+reg        old_acc;
+
+// Slots 48..52 match pce_savestates_pkg.vhd. addr is derived, not serialized.
+wire [63:0] ss_back[5], ss_restore[5], ss_dout[5];
+genvar i;
+generate
+for(i=0; i<4; i=i+1) begin : ss_ports
+	assign ss_back[i] = {1'b0, port[i].control, port[i].increment, port[i].offset, port[i].base};
+end
+assign ss_back[4] = {14'd0, old_acc, rotate_bits, shift_bits, shift_latch, ena};
+for(i=0; i<5; i=i+1) begin : ss_regs
+	eReg_SavestateV #(.Adr(48+i), .def(64'h0)) snapshot
+	(
+		.clk(CLK),
+		.BUS_Din(SaveStateBus_Din), .BUS_Adr(SaveStateBus_Adr),
+		.BUS_wren(SaveStateBus_wren), .BUS_rst(SaveStateBus_rst),
+		.BUS_Dout(ss_dout[i]), .Din(ss_back[i]), .Dout(ss_restore[i])
+	);
+end
+endgenerate
+assign SaveStateBus_Dout = ss_dout[0] | ss_dout[1] | ss_dout[2] | ss_dout[3] | ss_dout[4];
 
 assign SEL_N = ~(EN && &A[20:13] && (A[12:8] == 'h1A));
 assign RAM_A = port[p].addr;
@@ -104,7 +132,11 @@ end
 
 always @(posedge CLK) begin
 	for(int i=0; i<4; i++) begin
-		port[i].addr = port[i].base[20:0] + (port[i].control[1] ? {{5{port[i].control[3]}}, port[i].offset} : 21'd0);
+		// Reconstruct on the load edge, even if sleep drops before the next clock.
+		if(SaveStateBus_load)
+			port[i].addr <= ss_restore[i][20:0] + (ss_restore[i][57] ? {{5{ss_restore[i][59]}}, ss_restore[i][39:24]} : 21'd0);
+		else
+			port[i].addr <= port[i].base[20:0] + (port[i].control[1] ? {{5{port[i].control[3]}}, port[i].offset} : 21'd0);
 	end
 end
 
@@ -112,9 +144,7 @@ wire [3:0] rot = DI[3] ? (4'd8 - DI[2:0]) : DI[2:0];
 wire acc = ~(WR_N & RD_N);
 
 always @(posedge CLK) begin
-	reg old_acc;
-
-	old_acc <= acc;
+	if(!SLEEP && !SaveStateBus_load) old_acc <= acc;
 
 	if(~RST_N) begin
 		for(int i=0; i<4; i++) begin
@@ -127,8 +157,22 @@ always @(posedge CLK) begin
 		shift_latch <= 0;
 		shift_bits <= 0;
 		rotate_bits <= 0;
+		old_acc <= 0;
 	end
-	else if(~old_acc & acc) begin
+	else if(SaveStateBus_load) begin
+		for(int i=0; i<4; i++) begin
+			port[i].base <= ss_restore[i][23:0];
+			port[i].offset <= ss_restore[i][39:24];
+			port[i].increment <= ss_restore[i][55:40];
+			port[i].control <= ss_restore[i][62:56];
+		end
+		ena <= ss_restore[4][0];
+		shift_latch <= ss_restore[4][32:1];
+		shift_bits <= ss_restore[4][40:33];
+		rotate_bits <= ss_restore[4][48:41];
+		old_acc <= ss_restore[4][49];
+	end
+	else if(!SLEEP && ~old_acc && acc) begin
 
 		if(~SEL_N & ~WR_N) begin
 			if(!A[7]) begin
