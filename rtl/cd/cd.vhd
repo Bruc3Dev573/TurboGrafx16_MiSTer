@@ -4,6 +4,9 @@ library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.STD_LOGIC_TEXTIO.all;
 use IEEE.NUMERIC_STD.ALL;
+library work;
+use work.pBus_savestates.all;
+use work.pPCE_savestates.all;
 
 entity cd is
 	port(
@@ -17,6 +20,7 @@ entity cd is
 		EXT_WR_N		: in  std_logic;
 		EXT_RD_N		: in  std_logic;
 		CPU_CE		: in  std_logic;
+		CPU_WAIT_N	: out std_logic;
 		
 		SEL_N			: out std_logic;
 		IRQ_N			: out std_logic;
@@ -37,6 +41,8 @@ entity cd is
 		
 		CD_REGION   : in  std_logic;
 		CD_RESET		: out std_logic;
+		CD_RESET_DONE : in std_logic := '0';
+		CD_FAST_SEEK : out std_logic := '0';
 		
 		CD_DATA		: in std_logic_vector(7 downto 0);
 		CD_DATA_WR	: in std_logic;
@@ -48,7 +54,29 @@ entity cd is
 		
 		CD_SL			: out signed(15 downto 0);
 		CD_SR			: out signed(15 downto 0);
-		AD_S			: out signed(15 downto 0)
+		AD_S			: out signed(15 downto 0);
+
+		-- Savestates: slots 53-54 and 60-63; SCSI owns 55-59.
+		-- SLEEP freezes the consuming/decoding side; the CDDA/SUBC FIFO fill
+		-- paths stay live, so samples the HPS pushes during the freeze are kept
+		-- while the FIFOs have room.
+		SLEEP				: in std_logic := '0';
+		SaveStateBus_Din  : in  std_logic_vector(63 downto 0) := (others => '0');
+		SaveStateBus_Adr  : in  std_logic_vector(9 downto 0) := (others => '0');
+		SaveStateBus_wren : in  std_logic := '0';
+		SaveStateBus_rst  : in  std_logic := '0';
+		SaveStateBus_load : in  std_logic := '0';
+		SaveStateBus_Dout : out std_logic_vector(63 downto 0);
+		-- ADPCM DRAM walk (SAVETYPE_ADPCM = 9): byte addr, 2 nibbles per byte
+		SS_AD_Addr        : in  std_logic_vector(15 downto 0) := (others => '0');
+		SS_AD_RdEn        : in  std_logic := '0';
+		SS_AD_WrEn        : in  std_logic := '0';
+		SS_AD_WrData      : in  std_logic_vector(7 downto 0) := (others => '0');
+		SS_AD_RdData      : out std_logic_vector(7 downto 0);
+		-- CD-quiet veto for the composite boundary
+		SS_CD_HOLD        : out std_logic;
+		-- Post-load audio hold: freeze the machine until resumed CDDA is ready
+		SS_AUDIO_HOLD     : out std_logic
 	);
 end cd;
 
@@ -65,15 +93,69 @@ architecture rtl of cd is
 	signal SCSI_SEL_N			: std_logic;
 	signal SCSI_BSY_N			: std_logic;
 	signal SCSI_REQ_N			: std_logic;
+	signal SCSI_DATAIN_HELD	: std_logic;	-- staged DATAIN byte held during replay
 	signal SCSI_MSG_N			: std_logic;
 	signal SCSI_CD_N			: std_logic;
 	signal SCSI_IO_N			: std_logic;
+	signal SCSI_COMM_SEND_i	: std_logic;	-- internal tap: Quartus 17 cannot read out ports
 	signal CD_STOP_CD_SND	: std_logic;
+	signal SCSI_REPLAY_RESET : std_logic;
+
+	-- Save-only eReg 68: CD event times, in seconds since reset/load.
+	signal DBG_SECDIV  : unsigned(25 downto 0) := (others => '0');
+	signal DBG_SEC     : unsigned(15 downto 0) := (others => '0');
+	signal DBG_T_STAT  : unsigned(7 downto 0) := (others => '0');
+	signal DBG_T_COMM  : unsigned(7 downto 0) := (others => '0');
+	signal DBG_T_CDDA  : unsigned(7 downto 0) := (others => '0');
+	signal DBG_T_LOAD  : unsigned(7 downto 0) := (others => '0');
+	signal DBG_RSTCNT  : unsigned(7 downto 0) := (others => '0');
+	signal DBG_STATCNT : unsigned(7 downto 0) := (others => '0');
+	signal DBG_SG_D    : std_logic := '0';
+	signal DBG_CS_D    : std_logic := '0';
+	signal DBG_RN_D    : std_logic := '1';
+	signal DBG_QRY_CNT  : std_logic_vector(7 downto 0);	-- 7:4 = \$DE, 3:0 = \$DD
+	signal DBG_QRY_LAST : std_logic_vector(7 downto 0);
+	signal DBG_CMD_LEDGER : std_logic_vector(63 downto 0);
+	-- HPS command and transfer-end edge counts.
+	signal DBG_N_DEND  : unsigned(15 downto 0) := (others => '0');
+	signal DBG_N_CSEND : unsigned(15 downto 0) := (others => '0');
+	signal DBG_DEND_D  : std_logic := '0';
+	signal DBG_CSND_D  : std_logic := '0';
+	signal CD_DATA_END_i : std_logic;
+	signal SS_V_Dout_DBG68 : std_logic_vector(63 downto 0);
+	signal SS_V_Dout_DBG69 : std_logic_vector(63 downto 0);
+	signal SS_V_Dout_DBG70 : std_logic_vector(63 downto 0);
+	-- Save-only tail trace of the first READ6 after a load. Bank-zero reads
+	-- identify BIOS call sites, not an instruction PC (operands count too).
+	type TailTrace_t is array (0 to 7) of std_logic_vector(63 downto 0);
+	signal TAIL_TRACE, SS_Dout_TAIL : TailTrace_t := (others => (others => '0'));
+	signal TAIL_WAIT, TAIL_ARM : std_logic := '0';
+	signal TAIL_CLOCK : unsigned(31 downto 0) := (others => '0');
+	signal TAIL_ROM : std_logic_vector(15 downto 0) := (others => '1');
+	signal TAIL_RD_D, TAIL_WR_D, TAIL_BSY_D : std_logic := '1';
+	signal SCSI_COMM_i : std_logic_vector(95 downto 0);
 	
 	signal CD_DTD				: std_logic;	--CD data transfer done flag
 	signal CD_DTR				: std_logic;	--CD data transfer ready flag
 	signal CD_SUBCD			: std_logic;	--CD Subcode data ready flag
 	signal CD_DTD_EN			: std_logic;
+	-- Save-only CPU access counts for the CD register block.
+	signal DBG_CPURD  : unsigned(15 downto 0) := (others => '0');	-- reads of the CD register block
+	signal DBG_CPUWR  : unsigned(15 downto 0) := (others => '0');	-- writes to it
+	signal DBG_LASTRD : std_logic_vector(7 downto 0) := (others => '0');	-- last register read
+	signal DBG_LASTWR : std_logic_vector(7 downto 0) := (others => '0');	-- last register written
+	signal DBG_RD_D   : std_logic := '1';
+	-- Saturating per-register read counters.
+	type RegHits_t is array (0 to 15) of unsigned(3 downto 0);
+	signal DBG_RDHITS : RegHits_t := (others => (others => '0'));
+	-- Rising-edge counters for CPU-visible CD and ADPCM flags.
+	signal DBG_N_DTR   : unsigned(15 downto 0) := (others => '0');
+	signal DBG_N_DTD   : unsigned(15 downto 0) := (others => '0');
+	signal DBG_N_SUBCD : unsigned(15 downto 0) := (others => '0');
+	signal DBG_N_AEND  : unsigned(15 downto 0) := (others => '0');
+	signal DBG_F_D     : std_logic_vector(3 downto 0) := (others => '0');
+	signal SS_V_Dout_DBG71 : std_logic_vector(63 downto 0);
+	signal DBG_WR_D   : std_logic := '1';
 	signal CD_DTR_EN			: std_logic;
 --	signal CD_MOTOR			: std_logic;
 	signal CD_SUBCD_EN		: std_logic;
@@ -110,13 +192,14 @@ architecture rtl of cd is
 	signal ADPCM_HALF			: std_logic;							--ADPCM half reached flag
 	signal ADPCM_PLAY			: std_logic;
 	signal ADPCM_FREQ			: std_logic_vector(3 downto 0);
-	signal ADPCM_FADER		: std_logic_vector(2 downto 0);
+	signal ADPCM_FADER		: std_logic_vector(2 downto 0) := (others => '0');
 	signal ADPCM_RDDATA		: std_logic_vector(7 downto 0);
 	signal ADPCM_WRDATA		: std_logic_vector(7 downto 0);
 	signal ADPCM_WRITE_PEND	: std_logic;
 	signal ADPCM_READ_PEND	: std_logic;
 	signal PLAY_READ_PEND	: std_logic;
-	signal DMA_WRITE_PEND	: std_logic;
+	signal DMA_WRITE_PEND	: std_logic := '0';
+	signal DMA_STAGED			: std_logic := '0';	-- staged DATAIN byte owned by DMA
 	signal ADPCM_WRITE_NIB	: std_logic;
 	signal ADPCM_READ_NIB	: std_logic;
 	signal WRITE_PEND			: std_logic;
@@ -196,12 +279,46 @@ architecture rtl of cd is
 	signal SUBCD_CNT			: unsigned(3 downto 0);
 	signal SUBCD_BYTE			: std_logic_vector(7 downto 0);
 	signal SUBCD_BYTENUM		: unsigned(7 downto 0);
+	signal SUBCD_SKIP_LEFT	: unsigned(6 downto 0) := (others => '0');
+	signal SUBCD_RESUME		: std_logic := '0';
 	
 	--Fader
 	signal FADE_VOL 			: unsigned(10 downto 0);
 	signal FADE_CNT 			: unsigned(7 downto 0);
 	signal CDDA_FADE_VOL		: unsigned(10 downto 0);
 	signal ADPCM_FADE_VOL	: unsigned(10 downto 0);
+
+	--Savestates
+	type slv64_array6 is array (0 to 5) of std_logic_vector(63 downto 0);
+	signal SS_V      : slv64_array6;	-- 0=CD_1 1=CD_2 2=CD_3 3=CD_4 4=CD_5 5=CD_6
+	signal SS_V_BACK : slv64_array6 := (others => (others => '0'));
+	signal SS_V_Dout : slv64_array6;
+	signal SS_Dout_SCSI : std_logic_vector(63 downto 0);
+	signal SCSI_SS_QUIET : std_logic;
+	signal M5205_SS_DOUT : std_logic_vector(38 downto 0);
+	-- CDDA replay
+	signal CDDA_CONSUMED : unsigned(31 downto 0);
+	signal AUDIO_CMD_SET : std_logic;
+	signal REPLAY_SKIP   : unsigned(9 downto 0);
+	signal REPLAY_START  : std_logic;
+	signal REPLAY_CONSUMED : unsigned(31 downto 0);
+	signal SKIP_LEFT     : unsigned(9 downto 0) := (others => '0');
+	signal SKIP_GAP      : std_logic := '0';	-- idle cycle after a skip read (FIFO_EMPTY is registered)
+	signal REPLAY_AUDIO  : std_logic;
+	signal REPLAY_RESUME : std_logic;
+	signal REPLAY_AUDIO_D : std_logic := '0';
+	-- Post-load audio hold. AH freezes the machine (SLEEP via pce_top) while
+	-- the replay restarts CDDA; AH_GO marks the resuming flush; AH_WD bounds it.
+	signal AH            : std_logic := '0';
+	signal AH_GO         : std_logic := '0';
+	signal AH_WD         : unsigned(26 downto 0) := (others => '0');	-- bit26 = 1.56 s
+	signal AH_READY      : std_logic;
+	signal SKIP_EN       : std_logic;	-- skip drains and their count run during the hold
+	-- ADPCM walk shuttle: two nibble accesses per Save_RAM byte window
+	signal SS_AD_NIB   : std_logic := '0';
+	signal SS_AD_PH    : std_logic := '0';
+	signal SS_AD_LO    : std_logic_vector(3 downto 0);
+	signal SS_AD_PREV  : std_logic_vector(15 downto 0);
 
 begin
 
@@ -238,6 +355,7 @@ begin
 			ADPCM_CTRL <= (others => '0');
 			ADPCM_DMA_EN <= '0';
 			ADPCM_DMA_RUN <= '0';
+			DMA_STAGED <= '0';
 			ADPCM_END <= '0';
 			ADPCM_HALF <= '0';
 			ADPCM_PLAY <= '0';
@@ -251,7 +369,63 @@ begin
 			ADPCM_READ_NIB <= '0';
 			M5205_D <= (others => '0');
 		elsif rising_edge( CLK ) then
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				-- DMA stores the byte before completing ACK; the CPU consumes
+				-- it on its register read. Preserve ownership from the saved
+				-- DMA/ACK state before replay clears the live handshake.
+				DMA_STAGED <= (SS_V(1)(55) or SS_V(1)(56))          -- DMA_EN / DMA_RUN
+				              and (SS_V(1)(63)                       -- DMA_WRITE_PEND
+				                   or SS_V(0)(21)                    -- AUTO_ACK
+				                   or not SS_V(0)(8));               -- ACK asserted
+				-- Savestate restore (registers driven by this process)
+				SCSI_DBI      <= SS_V(0)(7 downto 0);
+				SCSI_ACK_N    <= SS_V(0)(8);
+				SCSI_RST_N    <= SS_V(0)(9);
+				SCSI_SEL_N    <= SS_V(0)(10);
+				CD_DTD        <= SS_V(0)(11);
+				CD_DTR        <= SS_V(0)(12);
+				CD_SUBCD      <= SS_V(0)(13);
+				CH_SEL        <= SS_V(0)(14);
+				BRAM_LOCK     <= SS_V(0)(15);
+				CD_DTD_EN     <= SS_V(0)(16);
+				CD_DTR_EN     <= SS_V(0)(17);
+				CD_SUBCD_EN   <= SS_V(0)(18);
+				ADPCM_END_EN  <= SS_V(0)(19);
+				ADPCM_HALF_EN <= SS_V(0)(20);
+				AUTO_ACK      <= SS_V(0)(21);
+				R1802_0       <= SS_V(0)(22);
+				R1802_1       <= SS_V(0)(23);
+				R180E_7_4     <= SS_V(0)(27 downto 24);
+				R180F_0       <= SS_V(0)(28);
+				R180F_7_4     <= SS_V(0)(32 downto 29);
+				CD_DATA_CNT   <= unsigned(SS_V(0)(43 downto 33));
+				SCSI_REQ_N_OLD <= SS_V(0)(44);
+				SCSI_BSY_N_OLD <= SS_V(0)(45);
+				SCSI_ACK_N_OLD <= SS_V(0)(46);
+				CDDA_VOL      <= SS_V(0)(63 downto 48);
+				ADPCM_OFFS    <= SS_V(1)(15 downto 0);
+				ADPCM_LEN     <= SS_V(1)(32 downto 16);
+				ADPCM_CTRL    <= SS_V(1)(47 downto 40);
+				ADPCM_FREQ    <= SS_V(1)(51 downto 48);
+				ADPCM_FADER   <= SS_V(1)(54 downto 52);
+				ADPCM_DMA_EN  <= SS_V(1)(55);
+				ADPCM_DMA_RUN <= SS_V(1)(56);
+				ADPCM_END     <= SS_V(1)(57);
+				ADPCM_HALF    <= SS_V(1)(58);
+				ADPCM_PLAY    <= SS_V(1)(59);
+				ADPCM_WRITE_PEND <= SS_V(1)(60);
+				ADPCM_READ_PEND  <= SS_V(1)(61);
+				PLAY_READ_PEND   <= SS_V(1)(62);
+				DMA_WRITE_PEND   <= SS_V(1)(63);
+				ADPCM_RDADDR  <= SS_V(2)(16 downto 0);
+				ADPCM_WRADDR  <= SS_V(2)(36 downto 20);
+				ADPCM_RDDATA  <= SS_V(2)(47 downto 40);
+				ADPCM_WRDATA  <= SS_V(2)(55 downto 48);
+				ADPCM_WRITE_NIB <= SS_V(2)(56);
+				ADPCM_READ_NIB  <= SS_V(2)(57);
+				M5205_D       <= SS_V(2)(61 downto 58);
+				CDDA_SAMPLE_OLD <= SS_V(4)(11);
+			elsif EN = '1' and SLEEP = '0' then
 			if CPU_CE = '1' then
 				SCSI_SEL_N <= '1';
 				if REG_SEL = '1' and EXT_WR_N = '0' then
@@ -345,7 +519,8 @@ begin
 				AUTO_ACK <= '0';
 			end if;
 			
-			if (ADPCM_DMA_EN = '1' or ADPCM_DMA_RUN = '1') and DMA_WRITE_PEND = '0' then
+			if (ADPCM_DMA_EN = '1' or ADPCM_DMA_RUN = '1') and DMA_WRITE_PEND = '0' and SCSI_DATAIN_HELD = '0' then
+				-- Do not consume the staged byte again while replay holds it.
 				if SCSI_REQ_N = '0' and SCSI_IO_N = '0' and SCSI_CD_N = '1' and SCSI_ACK_N = '1' then
 					ADPCM_WRDATA <= SCSI_DBO;
 					DMA_WRITE_PEND <= '1';
@@ -499,7 +674,7 @@ begin
 
 	WRITE_PEND <= ADPCM_WRITE_PEND or DMA_WRITE_PEND;
 	READ_PEND <= ADPCM_READ_PEND or PLAY_READ_PEND;
-	process( REG_SEL, EXT_A, SCSI_DBO, SCSI_DBI, SCSI_BSY_N, SCSI_REQ_N, SCSI_MSG_N, SCSI_CD_N, SCSI_IO_N, SCSI_ACK_N, SCSI_RST_N, 
+	process( REG_SEL, EXT_A, SCSI_DBO, SCSI_DBI, SCSI_BSY_N, SCSI_REQ_N, SCSI_DATAIN_HELD, SCSI_MSG_N, SCSI_CD_N, SCSI_IO_N, SCSI_ACK_N, SCSI_RST_N,
 				CD_DTR, CD_DTD, CD_SUBCD, SUBCD_BYTE, CD_DTR_EN, CD_DTD_EN, CD_SUBCD_EN, R1802_0, R1802_1, CH_SEL, ADPCM_RDDATA, ADPCM_DMA_EN, ADPCM_DMA_RUN, ADPCM_END, ADPCM_HALF, ADPCM_END_EN, ADPCM_HALF_EN, 
 				ADPCM_CTRL, ADPCM_FREQ, R180E_7_4, ADPCM_PLAY, ADPCM_FADER, R180F_0, R180F_7_4, READ_PEND, WRITE_PEND, CDDA_VOL, CD_REGION) 
 	begin
@@ -507,7 +682,9 @@ begin
 		if REG_SEL = '1' then
 			case EXT_A(7 downto 0) is
 				when x"00" =>
-					EXT_DO <= not SCSI_BSY_N & not SCSI_REQ_N & not SCSI_MSG_N & not SCSI_CD_N & not SCSI_IO_N & "000";
+					-- Hide staged DATAIN until replay restores the stream.
+					EXT_DO <= not SCSI_BSY_N & (not SCSI_REQ_N and not SCSI_DATAIN_HELD)
+					          & not SCSI_MSG_N & not SCSI_CD_N & not SCSI_IO_N & "000";
 				when x"01" =>
 					if SCSI_BSY_N = '0' then
 						EXT_DO <= SCSI_DBO;
@@ -517,7 +694,10 @@ begin
 				when x"02" =>
 					EXT_DO <= not SCSI_ACK_N & CD_DTR_EN & CD_DTD_EN & CD_SUBCD_EN & ADPCM_END_EN & ADPCM_HALF_EN & R1802_1 & R1802_0;
 				when x"03" =>
-					EXT_DO <= "0" & CD_DTR & CD_DTD & CD_SUBCD & ADPCM_END & ADPCM_HALF & CH_SEL & "0";--TODO	
+					-- CD_DTR ("a data byte is ready") is hidden for the same
+					-- reason: games that poll $1803 instead of $1800 would
+					-- otherwise chew through the one staged byte just as fast.
+					EXT_DO <= "0" & (CD_DTR and not SCSI_DATAIN_HELD) & CD_DTD & CD_SUBCD & ADPCM_END & ADPCM_HALF & CH_SEL & "0";--TODO
 				when x"04" =>
 					EXT_DO <= "000000" & not SCSI_RST_N & "0";
 				when x"05" =>
@@ -577,17 +757,27 @@ begin
 	end process;
 	
 	SEL_N <= not (REG_SEL and EN);
-	IRQ_N <= not ((CD_DTR_EN and CD_DTR) or (CD_DTD_EN and CD_DTD) or (CD_SUBCD_EN and CD_SUBCD) or (ADPCM_END_EN and ADPCM_END) or (ADPCM_HALF_EN and ADPCM_HALF));
+	-- Sector readers may consume $1808 without polling between bytes.
+	-- Stall the CPU until the restored stream is ready, not the CD replay.
+	CPU_WAIT_N <= not SCSI_DATAIN_HELD;
+	-- Mask both data-ready status and IRQ while the staged byte is held.
+	IRQ_N <= not ((CD_DTR_EN and CD_DTR and not SCSI_DATAIN_HELD) or (CD_DTD_EN and CD_DTD) or (CD_SUBCD_EN and CD_SUBCD) or (ADPCM_END_EN and ADPCM_END) or (ADPCM_HALF_EN and ADPCM_HALF));
 	
 	RAM_SEL <= '1' when EXT_A(20 downto 13) >= x"68" and EXT_A(20 downto 13) <= x"87" else '0';
 	RAM_CS_N <= not (RAM_SEL and EN);
 	
 	BRAM_EN <= not BRAM_LOCK or not EN;
-	CD_RESET <= not SCSI_RST_N;
+	CD_RESET <= (not SCSI_RST_N) or SCSI_REPLAY_RESET;
 	
 	SCSI : entity work.SCSI
 	port map (
-		RESET_N		=> RST_N and SCSI_RST_N,-- and EN
+		-- Same trap as the MSM5205 reset below: SCSI_RST_N is RESTORED state and
+		-- SCSI resets asynchronously, so a load taken while the game holds the CD
+		-- reset asserted would throw the whole restored SCSI state away.  Hold the
+		-- block out of reset for the savestate walk; afterwards the restored
+		-- SCSI_RST_N governs again.  The global RST_N is deliberately still able
+		-- to reset it at any time.
+		RESET_N		=> RST_N and (SCSI_RST_N or SLEEP),
 		CLK			=> CLK,
 		
 		DBI			=> SCSI_DBI,
@@ -605,18 +795,266 @@ begin
 		MESSAGE		=> CD_MSG,
 		STAT_GET		=> CD_STAT_GET,
 		
-		COMMAND		=> CD_COMM,
-		COMM_SEND	=> CD_COMM_SEND,
+		COMMAND		=> SCSI_COMM_i,
+		COMM_SEND	=> SCSI_COMM_SEND_i,
 		
 		DOUT_REQ		=> CD_DOUT_REQ,
 		DOUT			=> CD_DOUT,
 		DOUT_SEND	=> CD_DOUT_SEND,
 		STOP_CD_SND	=> CD_STOP_CD_SND,
+		CD_RESET_DONE => CD_RESET_DONE,
+		REPLAY_RESET => SCSI_REPLAY_RESET,
 		
 		CD_DATA		=> CD_DATA,
 		CD_WR			=> CD_DATA_WR,
-		CD_DATA_END	=> CD_DATA_END
+		CD_DATA_END	=> CD_DATA_END_i,
+		DATAIN_HELD	=> SCSI_DATAIN_HELD,
+
+		SLEEP				=> SLEEP,
+		DTD_EN			=> CD_DTD_EN,
+		SaveStateBus_Din  => SaveStateBus_Din,
+		SaveStateBus_Adr  => SaveStateBus_Adr,
+		SaveStateBus_wren => SaveStateBus_wren,
+		SaveStateBus_rst  => SaveStateBus_rst,
+		SaveStateBus_load => SaveStateBus_load,
+		SaveStateBus_Dout => SS_Dout_SCSI,
+		SS_QUIET				=> SCSI_SS_QUIET,
+		CDDA_CONSUMED	=> CDDA_CONSUMED,
+		AUDIO_CMD_SET	=> AUDIO_CMD_SET,
+		REPLAY_SKIP		=> REPLAY_SKIP,
+		DMA_STAGED		=> DMA_STAGED,
+		REPLAY_START	=> REPLAY_START,
+		REPLAY_CONSUMED => REPLAY_CONSUMED,
+		REPLAY_FAST => CD_FAST_SEEK,
+		REPLAY_AUDIO => REPLAY_AUDIO,
+		REPLAY_RESUME => REPLAY_RESUME,
+		DBG_QRY_CNT		=> DBG_QRY_CNT,
+		DBG_QRY_LAST	=> DBG_QRY_LAST,
+		DBG_CMD_LEDGER	=> DBG_CMD_LEDGER
 	);
+
+	CD_COMM_SEND <= SCSI_COMM_SEND_i;
+	CD_COMM <= SCSI_COMM_i;
+	CD_DATA_END  <= CD_DATA_END_i;
+
+	-- eRegs 76..83: oldest to newest. Each record contains elapsed clocks/256
+	-- (63:40), last bank-zero read address (39:24), event (23:16), value
+	-- (15:8), and BSY_N/REQ_N/MSG_N/CD_N/IO_N/ACK_N/DTD_EN/DTR_EN (7:0).
+	-- Events: 1=$1801 read in STATUS/MSGIN, 2=$1802 ACK-changing write,
+	-- 3=bus release, 4=READ6 arm. Freeze on bus release; never restore.
+	process(CLK)
+		variable event, value, lines : std_logic_vector(7 downto 0);
+	begin
+		if rising_edge(CLK) then
+			if RST_N = '0' or SaveStateBus_load = '1' then
+				TAIL_TRACE <= (others => (others => '0'));
+				TAIL_WAIT <= SaveStateBus_load;
+				TAIL_ARM <= '0';
+				TAIL_CLOCK <= (others => '0');
+				TAIL_ROM <= (others => '1');
+				TAIL_RD_D <= '1'; TAIL_WR_D <= '1'; TAIL_BSY_D <= '1';
+			else
+				TAIL_RD_D <= EXT_RD_N;
+				TAIL_WR_D <= EXT_WR_N;
+				TAIL_BSY_D <= SCSI_BSY_N;
+				if EN = '1' and SLEEP = '0' and CPU_CE = '1'
+				   and EXT_RD_N = '0' and EXT_A(20 downto 13) = x"00" then
+					TAIL_ROM <= "000" & EXT_A(12 downto 0);
+				end if;
+				event := x"00"; value := x"00";
+				lines := SCSI_BSY_N & SCSI_REQ_N & SCSI_MSG_N & SCSI_CD_N
+				         & SCSI_IO_N & SCSI_ACK_N & CD_DTD_EN & CD_DTR_EN;
+				if TAIL_WAIT = '1' and SCSI_COMM_SEND_i = '1'
+				   and SCSI_COMM_i(7 downto 0) = x"08" then
+					TAIL_WAIT <= '0'; TAIL_ARM <= '1';
+					TAIL_CLOCK <= (others => '0');
+					event := x"04"; value := SCSI_COMM_i(39 downto 32);
+				elsif TAIL_ARM = '1' then
+					if TAIL_CLOCK /= x"FFFFFFFF" then TAIL_CLOCK <= TAIL_CLOCK + 1; end if;
+					if SCSI_BSY_N = '1' and TAIL_BSY_D = '0' then
+						event := x"03";
+						TAIL_ARM <= '0';
+					elsif EN = '1' and SLEEP = '0' and REG_SEL = '1' then
+						if EXT_RD_N = '0' and TAIL_RD_D = '1' and EXT_A(7 downto 0) = x"01"
+						   and SCSI_CD_N = '0' and SCSI_IO_N = '0' then
+							event := x"01"; value := SCSI_DBO;
+						elsif EXT_WR_N = '0' and TAIL_WR_D = '1' and EXT_A(7 downto 0) = x"02"
+						   and EXT_DI(7) = SCSI_ACK_N then
+							event := x"02"; value := EXT_DI;
+						end if;
+					end if;
+				end if;
+				if event /= x"00" then
+					for i in 0 to 6 loop TAIL_TRACE(i) <= TAIL_TRACE(i+1); end loop;
+					TAIL_TRACE(7) <= std_logic_vector(TAIL_CLOCK(31 downto 8))
+					                 & TAIL_ROM & event & value & lines;
+				end if;
+			end if;
+		end if;
+	end process;
+
+	GEN_TAIL_TRACE : for i in 0 to 7 generate
+		iSS_TAIL : entity work.eReg_SavestateV
+		generic map ( Adr => 76+i, def => SSREG_DEFAULT_CD )
+		port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+		           SaveStateBus_rst, SS_Dout_TAIL(i), TAIL_TRACE(i), open );
+	end generate;
+
+	process( CLK ) begin
+		if rising_edge(CLK) then
+			if RST_N = '0' then
+				DBG_N_DEND <= (others => '0'); DBG_N_CSEND <= (others => '0');
+			else
+				DBG_DEND_D <= CD_DATA_END_i;
+				if CD_DATA_END_i = '1' and DBG_DEND_D = '0' then
+					DBG_N_DEND <= DBG_N_DEND + 1;
+				end if;
+				DBG_CSND_D <= SCSI_COMM_SEND_i;
+				if SCSI_COMM_SEND_i = '1' and DBG_CSND_D = '0' then
+					DBG_N_CSEND <= DBG_N_CSEND + 1;
+				end if;
+			end if;
+		end if;
+	end process;
+
+	-- Save-only eReg 68: CD interface event times at one-second resolution.
+	process( CLK )
+	begin
+		if rising_edge(CLK) then
+			if RST_N = '0' then
+				DBG_SECDIV <= (others => '0'); DBG_SEC <= (others => '0');
+				DBG_T_STAT <= (others => '0'); DBG_T_COMM <= (others => '0');
+				DBG_T_CDDA <= (others => '0'); DBG_T_LOAD <= (others => '0');
+				DBG_RSTCNT <= (others => '0'); DBG_STATCNT <= (others => '0');
+			else
+				DBG_SECDIV <= DBG_SECDIV + 1;
+				if DBG_SECDIV = 42954544 then
+					DBG_SECDIV <= (others => '0');
+					if DBG_SEC /= x"FFFF" then
+						DBG_SEC <= DBG_SEC + 1;
+					end if;
+				end if;
+				DBG_SG_D <= CD_STAT_GET;
+				if CD_STAT_GET = '1' and DBG_SG_D = '0' then
+					DBG_T_STAT <= DBG_SEC(7 downto 0);
+					if DBG_STATCNT /= x"FF" then
+						DBG_STATCNT <= DBG_STATCNT + 1;
+					end if;
+				end if;
+				DBG_CS_D <= SCSI_COMM_SEND_i;
+				if SCSI_COMM_SEND_i = '1' and DBG_CS_D = '0' then
+					DBG_T_COMM <= DBG_SEC(7 downto 0);
+				end if;
+				DBG_RN_D <= SCSI_RST_N;
+				if SCSI_RST_N = '0' and DBG_RN_D = '1' then
+					if DBG_RSTCNT /= x"FF" then
+						DBG_RSTCNT <= DBG_RSTCNT + 1;
+					end if;
+				end if;
+				if CD_AUDIO_WR = '1' then
+					DBG_T_CDDA <= DBG_SEC(7 downto 0);
+				end if;
+				if SaveStateBus_load = '1' then
+					DBG_T_LOAD <= DBG_SEC(7 downto 0);
+				end if;
+			end if;
+		end if;
+	end process;
+
+	iSS_CD_DBG68 : entity work.eReg_SavestateV
+	generic map ( Adr => 68, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout_DBG68,
+	           std_logic_vector(DBG_STATCNT) & std_logic_vector(DBG_RSTCNT)
+	         & std_logic_vector(DBG_T_LOAD) & std_logic_vector(DBG_T_CDDA)
+	         & std_logic_vector(DBG_T_COMM) & std_logic_vector(DBG_T_STAT)
+	         & std_logic_vector(DBG_SEC), open );
+
+	-- eReg 69: CPU register accesses counted on edges, since reset/load.
+	--   15:0  reads of $1800..$18FF      39:32 last register read
+	--   31:16 writes to it               47:40 last register written
+	--   55:48 query commands issued     63:56 last query opcode
+	-- Query counts survive load and describe the current title's commands.
+	process( CLK )
+	begin
+		if rising_edge(CLK) then
+			if RST_N = '0' then
+				DBG_CPURD <= (others => '0'); DBG_CPUWR <= (others => '0');
+				DBG_LASTRD <= (others => '0'); DBG_LASTWR <= (others => '0');
+				DBG_RD_D <= '1'; DBG_WR_D <= '1';
+				DBG_RDHITS <= (others => (others => '0'));
+			else
+				DBG_RD_D <= EXT_RD_N;
+				if REG_SEL = '1' and EXT_RD_N = '0' and DBG_RD_D = '1' then
+					DBG_LASTRD <= EXT_A(7 downto 0);
+					if DBG_CPURD /= x"FFFF" then
+						DBG_CPURD <= DBG_CPURD + 1;
+					end if;
+					if DBG_RDHITS(to_integer(unsigned(EXT_A(3 downto 0)))) /= x"F" then
+						DBG_RDHITS(to_integer(unsigned(EXT_A(3 downto 0))))
+							<= DBG_RDHITS(to_integer(unsigned(EXT_A(3 downto 0)))) + 1;
+					end if;
+				end if;
+				DBG_WR_D <= EXT_WR_N;
+				if REG_SEL = '1' and EXT_WR_N = '0' and DBG_WR_D = '1' then
+					DBG_LASTWR <= EXT_A(7 downto 0);
+					if DBG_CPUWR /= x"FFFF" then
+						DBG_CPUWR <= DBG_CPUWR + 1;
+					end if;
+				end if;
+			end if;
+		end if;
+	end process;
+
+	iSS_CD_DBG69 : entity work.eReg_SavestateV
+	generic map ( Adr => 69, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout_DBG69,
+	           DBG_QRY_LAST & DBG_QRY_CNT & DBG_LASTWR & DBG_LASTRD
+	         & std_logic_vector(DBG_CPUWR) & std_logic_vector(DBG_CPURD), open );
+
+	-- eReg 70: replay diagnostics from SCSI.
+	-- 11:0 READ_SKIP, 12 EMPTY, 13 RSKIP_GAP, 14 SLEEP, 15 RP_FREEZE,
+	-- 17:16 SWALLOW, 41:18 RSKIP_STARVE, 45:42 replay state,
+	-- 46 TAILDRAIN, 47 READ_ACTIVE, 63:48 FIFO byte count.
+	iSS_CD_DBG70 : entity work.eReg_SavestateV
+	generic map ( Adr => 70, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout_DBG70, DBG_CMD_LEDGER, open );
+
+	-- eReg 71: rises of the four flags the program polls, since the load.
+	process( CLK )
+	begin
+		if rising_edge(CLK) then
+			if RST_N = '0' then
+				DBG_N_DTR <= (others => '0'); DBG_N_DTD <= (others => '0');
+				DBG_N_SUBCD <= (others => '0'); DBG_N_AEND <= (others => '0');
+				DBG_F_D <= (others => '0');
+			else
+				DBG_F_D <= CD_DTR & CD_DTD & CD_SUBCD & ADPCM_END;
+				if CD_DTR = '1' and DBG_F_D(3) = '0' and DBG_N_DTR /= x"FFFF" then
+					DBG_N_DTR <= DBG_N_DTR + 1;
+				end if;
+				if CD_DTD = '1' and DBG_F_D(2) = '0' and DBG_N_DTD /= x"FFFF" then
+					DBG_N_DTD <= DBG_N_DTD + 1;
+				end if;
+				if CD_SUBCD = '1' and DBG_F_D(1) = '0' and DBG_N_SUBCD /= x"FFFF" then
+					DBG_N_SUBCD <= DBG_N_SUBCD + 1;
+				end if;
+				if ADPCM_END = '1' and DBG_F_D(0) = '0' and DBG_N_AEND /= x"FFFF" then
+					DBG_N_AEND <= DBG_N_AEND + 1;
+				end if;
+			end if;
+		end if;
+	end process;
+
+	iSS_CD_DBG71 : entity work.eReg_SavestateV
+	generic map ( Adr => 71, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout_DBG71,
+	           std_logic_vector(DBG_N_CSEND) & std_logic_vector(DBG_N_DEND)
+	         & std_logic_vector(DBG_N_DTD) & std_logic_vector(DBG_N_DTR), open );
+	-- Bits 63:48 count CD_COMM_SEND; 47:32 count CD_DATA_END.
 
 
 	--ADPCM DRAM
@@ -627,7 +1065,7 @@ begin
 			DRAM_CLKEN <= '0';
 			DRAM_SLOT_CNT <= (others => '0');
 		elsif rising_edge(CLK) then
-			if EN = '1' then
+			if EN = '1' and SLEEP = '0' then
 				DRAM_CLKEN <= '0';
 				DRAM_CLK_CNT <= DRAM_CLK_CNT + 1;
 				if DRAM_CLK_CNT = 18-1 then
@@ -660,9 +1098,43 @@ begin
 		wren_a	=> ADRAM_WE,
 		q_a		=> ADRAM_DO
 	);
-	ADRAM_A <= ADPCM_WRADDR when DRAM_SLOT = SLOT_WRITE else ADPCM_RDADDR;
-	ADRAM_DI <= ADPCM_WRDATA(3 downto 0) when ADPCM_WRITE_NIB = '1' else ADPCM_WRDATA(7 downto 4);
-	ADRAM_WE <= DRAM_CLKEN when DRAM_SLOT = SLOT_WRITE and (ADPCM_WRITE_PEND = '1' or DMA_WRITE_PEND = '1') else '0';
+	-- Savestate walk borrows the (single) DRAM port during the freeze: the
+	-- slot machine is SLEEP-held.  Byte address -> two nibble accesses,
+	-- sequenced by SS_AD_NIB inside the engine's 8-cycle byte window
+	-- (hi nibble first: byte = ADRAM[2a] & ADRAM[2a+1]).
+	ADRAM_A <= SS_AD_Addr & SS_AD_NIB when SLEEP = '1' else
+	           ADPCM_WRADDR when DRAM_SLOT = SLOT_WRITE else ADPCM_RDADDR;
+	ADRAM_DI <= SS_AD_WrData(7 downto 4) when SLEEP = '1' and SS_AD_NIB = '0' else
+	            SS_AD_WrData(3 downto 0) when SLEEP = '1' else
+	            ADPCM_WRDATA(3 downto 0) when ADPCM_WRITE_NIB = '1' else ADPCM_WRDATA(7 downto 4);
+	ADRAM_WE <= SS_AD_WrEn when SLEEP = '1' else
+	            DRAM_CLKEN when DRAM_SLOT = SLOT_WRITE and (ADPCM_WRITE_PEND = '1' or DMA_WRITE_PEND = '1') else '0';
+
+	-- The ADPCM RAM read is registered. Present nibble 0, wait one clock,
+	-- latch its data, then select nibble 1 for the second half of the byte.
+	process( CLK ) begin
+		if rising_edge( CLK ) then
+			if SLEEP = '0' then
+				SS_AD_NIB  <= '0';
+				SS_AD_PH   <= '0';
+				SS_AD_PREV <= (others => '1');
+			else
+				if SS_AD_Addr /= SS_AD_PREV then
+					SS_AD_PREV <= SS_AD_Addr;
+					SS_AD_NIB  <= '0';
+					SS_AD_PH   <= '0';		-- restart: this cycle presents 2*addr
+				elsif SS_AD_NIB = '0' and (SS_AD_RdEn = '1' or SS_AD_WrEn = '1') then
+					if SS_AD_PH = '0' then
+						SS_AD_PH <= '1';		-- wait for the registered read (hi half)
+					else
+						SS_AD_LO  <= ADRAM_DO;	-- now ADRAM_DO = hi nibble at 2*addr
+						SS_AD_NIB <= '1';
+					end if;
+				end if;
+			end if;
+		end if;
+	end process;
+	SS_AD_RdData <= SS_AD_LO & ADRAM_DO;
 
 	
 	process( RST_N, CLK )
@@ -672,9 +1144,11 @@ begin
 			M5205_CLK <= '0';
 		elsif rising_edge(CLK) then
 			M5205_CLK <= '0';
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				M5205_CLK_CNT <= to_integer(unsigned(SS_V(3)(46 downto 38)));
+			elsif EN = '1' and SLEEP = '0' then
 				if ADPCM_CE = '1' then
-					-- M5205 CLK = 42954545Hz / (ACT(n)+1)
+					-- Divide ADPCM_CE by (16 - ADPCM_FREQ).
 					M5205_CLK_CNT <= M5205_CLK_CNT + 1;
 					if M5205_CLK_CNT >= 15 - unsigned(ADPCM_FREQ) then
 						M5205_CLK_CNT <= 0;
@@ -687,7 +1161,17 @@ begin
 	
 	MSM5205 : entity work.MSM5205
 	port map (
-		RST_N		=> not ADPCM_CTRL(7) and ADPCM_PLAY and EN,
+		-- The decoder's reset is derived from ADPCM_PLAY, which is itself restored
+		-- state, and MSM5205 resets DEC_DATA/STEP/SAMPLE ASYNCHRONOUSLY - so the
+		-- async reset wins over the synchronous SS_load restore.  Loading a state
+		-- in which ADPCM was playing while the machine currently has PLAY=0 (the
+		-- ordinary case) therefore threw the restored decoder state away and
+		-- resumed from SAMPLE=0/STEP=0.  ADPCM is differential, so everything
+		-- after that point is wrong.  Holding the decoder out of reset for the
+		-- whole savestate walk (SLEEP) lets the restore land; once SLEEP drops,
+		-- the RESTORED ADPCM_PLAY governs again, so a state that was not playing
+		-- still ends up properly reset.
+		RST_N		=> ((not ADPCM_CTRL(7) and ADPCM_PLAY) or SLEEP) and EN,
 		CLK		=> CLK,
 		
 		XTI		=> M5205_CLK,
@@ -695,7 +1179,12 @@ begin
 		VCK_R		=> M5205_VCK_R,
 		--VCK_F		=> M5205_VCK_F,
 		
-		SOUT		=> M5205_SOUT
+		SOUT		=> M5205_SOUT,
+
+		SLEEP		=> SLEEP,
+		SS_load	=> SaveStateBus_load,
+		SS_DIN	=> SS_V(3)(38 downto 0),
+		SS_DOUT	=> M5205_SS_DOUT
 	);
 
 	
@@ -709,9 +1198,16 @@ begin
 			CD_WR_OLD <= '0';
 		elsif rising_edge(CLK) then
 			FIFO_WR_REQ <= '0';
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				CD_WR_OLD   <= SS_V(0)(47);
+				CD_BYTE_CNT <= unsigned(SS_V(4)(9 downto 8));
+			elsif EN = '1' then
 				CD_WR_OLD <= CD_AUDIO_WR;
-				if DM = '1' then
+				if REPLAY_START = '1' then
+					-- replayed stream starts at a frame boundary: realign the
+					-- assembler (the restored/live-tail phase is meaningless)
+					CD_BYTE_CNT <= (others => '0');
+				elsif DM = '1' then
 					CD_BYTE_CNT <= (others => '0');
 				elsif CD_AUDIO_WR = '1' and CD_WR_OLD = '0' then
 					CD_BYTE_CNT <= CD_BYTE_CNT + 1;
@@ -769,7 +1265,9 @@ begin
 			SUBCD_WR_OLD <= '0';
 		elsif rising_edge(CLK) then
 			SUBCD_FIFO_WR_REQ <= '0';
-			if EN = '1' then
+			if SaveStateBus_load = '1' then
+				SUBCD_WR_OLD <= SS_V(4)(34);
+			elsif EN = '1' then
 				SUBCD_WR_OLD <= CD_SUBCD_WR;
 				if CD_SUBCD_WR = '1' and SUBCD_WR_OLD = '0' then
 					SUBCD_FIFO_D(7 downto 0) <= CD_DATA;
@@ -806,6 +1304,8 @@ begin
 			SUBCD_BYTENUM <= (others => '0');
 			SUBCD_FIFO_SCLR <= '1';
 			SUBCD_FIFO_RD_REQ <= '0';
+			SUBCD_SKIP_LEFT <= (others => '0');
+			SUBCD_RESUME <= '0';
 
 		elsif rising_edge(CLK) then
 			FIFO_RD_REQ <= '0';
@@ -813,7 +1313,59 @@ begin
 			SUBCD_FIFO_RD_REQ <= '0';
 			SUBCD_FIFO_SCLR <= '0';
 			
-			if CDDA_CE = '1' and EN = '1' then	-- ~44.1kHz
+			if REPLAY_START = '1' then
+				-- Discard the live tail and restart at the replayed sector.
+				FIFO_SCLR <= '1';
+				SUBCD_FIFO_SCLR <= '1';
+				SUBCD_BYTENUM <= (others => '0');
+				SUBCD_CNT <= (others => '0');
+				SUBCD_CE <= '0';
+				SUBCD_SKIP_LEFT <= (others => '0');
+				SUBCD_RESUME <= '0';
+				if REPLAY_SKIP /= 0 then
+					SUBCD_RESUME <= '1';
+				end if;
+			elsif SaveStateBus_load = '1' then
+				CDDA_SAMPLE   <= SS_V(4)(10);
+				SUBCD_CNT     <= unsigned(SS_V(4)(15 downto 12));
+				SUBCD_BYTE    <= SS_V(4)(23 downto 16);
+				SUBCD_BYTENUM <= unsigned(SS_V(4)(31 downto 24));
+				SUBCD_CE      <= SS_V(4)(32);
+				OUTL          <= signed(SS_V(4)(50 downto 35));
+				OUTR          <= signed(SS_V(5)(15 downto 0));
+				SUBCD_SKIP_LEFT <= (others => '0');
+				SUBCD_RESUME <= '0';
+			elsif SUBCD_RESUME = '1' and (CD_STOP_CD_SND = '1' or SCSI_RST_N = '0' or AUDIO_CMD_SET = '1') then
+				SUBCD_SKIP_LEFT <= (others => '0');
+				SUBCD_RESUME <= '0';
+				SUBCD_CNT <= (others => '0');
+				SUBCD_BYTENUM <= (others => '0');
+				SUBCD_CE <= '0';
+			elsif SKIP_LEFT /= 0 or SKIP_GAP = '1' then
+				SUBCD_CE <= '0';
+				if SKIP_LEFT /= 0 and SKIP_GAP = '0' and FIFO_EMPTY = '0' and SKIP_EN = '1' then
+					FIFO_RD_REQ <= '1';
+					-- Main sends audio before subcode. Keep the byte debt until
+					-- its FIFO fills; advancing empty reads would lose the prefix.
+					if SUBCD_CNT = 5 then
+						SUBCD_CNT <= (others => '0');
+						SUBCD_BYTENUM <= SUBCD_BYTENUM + 1;
+						SUBCD_SKIP_LEFT <= SUBCD_SKIP_LEFT + 1;
+					else
+						SUBCD_CNT <= SUBCD_CNT + 1;
+					end if;
+				end if;
+			elsif SUBCD_SKIP_LEFT /= 0 or SUBCD_FIFO_RD_REQ = '1' then
+				SUBCD_CE <= '0';
+				-- Leave a clock after each pop for the registered EMPTY flag.
+				if SUBCD_SKIP_LEFT /= 0 and SUBCD_FIFO_RD_REQ = '0' and SUBCD_FIFO_EMPTY = '0' and SKIP_EN = '1' then
+					SUBCD_FIFO_RD_REQ <= '1';
+					SUBCD_SKIP_LEFT <= SUBCD_SKIP_LEFT - 1;
+				end if;
+			elsif SUBCD_RESUME = '1' and SUBCD_FIFO_EMPTY = '1' then
+				-- Do not start the audible remainder ahead of its subcode.
+				SUBCD_CE <= '0';
+			elsif CDDA_CE = '1' and EN = '1' and SLEEP = '0' then	-- ~44.1kHz
 				CDDA_SAMPLE <= not CDDA_SAMPLE;
 				if FIFO_EMPTY = '0' then
 					FIFO_RD_REQ <= '1';
@@ -829,12 +1381,13 @@ begin
 				end if;
 
 
-				if SUBCD_CNT = 0 then
+				if SUBCD_CNT = 0 or SUBCD_RESUME = '1' then
 					SUBCD_CE <= '1';									-- set interrupt flag
 					
 					if SUBCD_FIFO_EMPTY = '0' then
 						SUBCD_FIFO_RD_REQ <= '1';
 						SUBCD_BYTE <= SUBCD_FIFO_Q(7 downto 0);
+						SUBCD_RESUME <= '0';
 					end if;
 
 					-- Note that there are 96 bytes in a subcode sector, PLUS 2 bytes as a 'synchronization word'
@@ -863,6 +1416,96 @@ begin
 	end process;
 
 			
+	-- Count consumed samples and discard the restored sub-sector remainder.
+	-- The counter is restored from CD_6(58:27).
+	process( RST_N, CLK )
+	begin
+		if RST_N = '0' then
+			CDDA_CONSUMED <= (others => '0');
+			SKIP_LEFT <= (others => '0');
+			SKIP_GAP  <= '0';
+		elsif rising_edge(CLK) then
+			if SaveStateBus_load = '1' then
+				CDDA_CONSUMED <= unsigned(SS_V(5)(58 downto 27));
+				SKIP_LEFT <= (others => '0');
+				SKIP_GAP  <= '0';
+			else
+				if AUDIO_CMD_SET = '1' then
+					CDDA_CONSUMED <= (others => '0');
+				elsif REPLAY_START = '1' then
+					-- Drop stale pops and count the replay drain back up to the
+					-- saved position, rather than adding its skip a second time.
+					CDDA_CONSUMED <= REPLAY_CONSUMED;
+				elsif FIFO_RD_REQ = '1' and SKIP_EN = '1' then
+					CDDA_CONSUMED <= CDDA_CONSUMED + 1;
+				end if;
+				-- Leave an idle clock after each pop: FIFO_EMPTY is registered.
+				if REPLAY_START = '1' then
+					SKIP_LEFT <= REPLAY_SKIP;
+					SKIP_GAP  <= '0';
+				elsif SUBCD_RESUME = '1' and (CD_STOP_CD_SND = '1' or SCSI_RST_N = '0' or AUDIO_CMD_SET = '1') then
+					SKIP_LEFT <= (others => '0');
+					SKIP_GAP <= '0';
+				elsif SKIP_GAP = '1' then
+					SKIP_GAP <= '0';
+				elsif SKIP_LEFT /= 0 and FIFO_EMPTY = '0' and SKIP_EN = '1' then
+					SKIP_LEFT <= SKIP_LEFT - 1;
+					SKIP_GAP  <= '1';
+					-- FIFO_RD_REQ already accounts for the discarded sample.
+				end if;
+			end if;
+		end if;
+	end process;
+
+	-- Post-load audio hold. A load that restores active CDDA keeps the whole
+	-- machine frozen (pce_top ORs AH into SLEEP) until the replay's resuming
+	-- flush has run, both skip drains are done and the saved sample heads the
+	-- FIFO with its subcode present. CPU, video and the DAC then restart on
+	-- the same clock, the DAC on its next 44.1 kHz tick. Nothing but the skip
+	-- drains advances during the hold. The hold ends at once when the replay
+	-- resumes nothing, and after 2^26 clocks (1.56 s) regardless.
+	SKIP_EN <= not SLEEP or AH;
+	AH_READY <= '1' when REPLAY_START = '0' and FIFO_SCLR = '0' and FIFO_RD_REQ = '0'
+	                     and SKIP_LEFT = 0 and SKIP_GAP = '0'
+	                     and SUBCD_SKIP_LEFT = 0 and SUBCD_FIFO_RD_REQ = '0'
+	                     and FIFO_EMPTY = '0'
+	                     and (SUBCD_RESUME = '0' or SUBCD_FIFO_EMPTY = '0') else '0';
+
+	process( RST_N, CLK )
+	begin
+		if RST_N = '0' then
+			AH <= '0';
+			AH_GO <= '0';
+			AH_WD <= (others => '0');
+			REPLAY_AUDIO_D <= '0';
+		elsif rising_edge(CLK) then
+			REPLAY_AUDIO_D <= REPLAY_AUDIO;
+			if SaveStateBus_load = '1' then
+				AH <= '0';
+				AH_GO <= '0';
+			elsif REPLAY_AUDIO = '1' and REPLAY_AUDIO_D = '0' then
+				-- raised by SCSI on the load that restores active CDDA
+				AH <= EN;
+				AH_GO <= '0';
+				AH_WD <= (others => '0');
+			elsif AH = '1' then
+				AH_WD <= AH_WD + 1;
+				if REPLAY_RESUME = '1' then
+					AH_GO <= '1';
+				end if;
+				if AH_WD(26) = '1' then
+					AH <= '0';
+				elsif AH_GO = '0' and REPLAY_AUDIO = '0' and REPLAY_RESUME = '0' then
+					AH <= '0';	-- the replay resumes nothing
+				elsif AH_GO = '1' and AH_READY = '1' then
+					AH <= '0';
+				end if;
+			end if;
+		end if;
+	end process;
+
+	SS_AUDIO_HOLD <= AH;
+
 	--Fader
 	process( RST_N, CLK )
 	begin
@@ -870,7 +1513,10 @@ begin
 			FADE_VOL <= "01111111111";
 			FADE_CNT <= (others => '0');
 		elsif rising_edge(CLK) then
-			if CDDA_CE = '1' and EN = '1' then
+			if SaveStateBus_load = '1' then
+				FADE_CNT <= unsigned(SS_V(4)(7 downto 0));
+				FADE_VOL <= unsigned(SS_V(5)(26 downto 16));
+			elsif CDDA_CE = '1' and EN = '1' and SLEEP = '0' then
 				if FADE_VOL(9 downto 0) > 0 and ADPCM_FADER(2) = '1' then
 					FADE_CNT <= FADE_CNT + 1;
 					if (FADE_CNT = 107 and ADPCM_FADER(1) = '1') or 	--2.5s
@@ -892,5 +1538,120 @@ begin
 	CD_SR <= OUTR;
 
 	AD_S <= x"0000" when ADPCM_PLAY = '0' else resize(shift_right(M5205_SOUT * signed(ADPCM_FADE_VOL), 10), AD_S'length);
+
+	--------------------------------------------------------------------------------
+	-- Savestates (slot map in pce_savestates_pkg.vhd)
+	--------------------------------------------------------------------------------
+	-- NOT saved: CDDA/SUBC FIFO content (refilled by the stream; the fill
+	-- paths run through the freeze so no pushed sample is lost), CEGen
+	-- CLK_SUM phases, SCSI_FIFO (drained by the CD-quiet boundary).
+
+	SS_V_BACK(0)(7 downto 0)   <= SCSI_DBI;
+	SS_V_BACK(0)(8)            <= SCSI_ACK_N;
+	SS_V_BACK(0)(9)            <= SCSI_RST_N;
+	SS_V_BACK(0)(10)           <= SCSI_SEL_N;
+	SS_V_BACK(0)(11)           <= CD_DTD;
+	SS_V_BACK(0)(12)           <= CD_DTR;
+	SS_V_BACK(0)(13)           <= CD_SUBCD;
+	SS_V_BACK(0)(14)           <= CH_SEL;
+	SS_V_BACK(0)(15)           <= BRAM_LOCK;
+	SS_V_BACK(0)(16)           <= CD_DTD_EN;
+	SS_V_BACK(0)(17)           <= CD_DTR_EN;
+	SS_V_BACK(0)(18)           <= CD_SUBCD_EN;
+	SS_V_BACK(0)(19)           <= ADPCM_END_EN;
+	SS_V_BACK(0)(20)           <= ADPCM_HALF_EN;
+	SS_V_BACK(0)(21)           <= AUTO_ACK;
+	SS_V_BACK(0)(22)           <= R1802_0;
+	SS_V_BACK(0)(23)           <= R1802_1;
+	SS_V_BACK(0)(27 downto 24) <= R180E_7_4;
+	SS_V_BACK(0)(28)           <= R180F_0;
+	SS_V_BACK(0)(32 downto 29) <= R180F_7_4;
+	SS_V_BACK(0)(43 downto 33) <= std_logic_vector(CD_DATA_CNT);
+	SS_V_BACK(0)(44)           <= SCSI_REQ_N_OLD;
+	SS_V_BACK(0)(45)           <= SCSI_BSY_N_OLD;
+	SS_V_BACK(0)(46)           <= SCSI_ACK_N_OLD;
+	SS_V_BACK(0)(47)           <= CD_WR_OLD;
+	SS_V_BACK(0)(63 downto 48) <= CDDA_VOL;
+
+	SS_V_BACK(1)(15 downto 0)  <= ADPCM_OFFS;
+	SS_V_BACK(1)(32 downto 16) <= ADPCM_LEN;
+	SS_V_BACK(1)(47 downto 40) <= ADPCM_CTRL;
+	SS_V_BACK(1)(51 downto 48) <= ADPCM_FREQ;
+	SS_V_BACK(1)(54 downto 52) <= ADPCM_FADER;
+	SS_V_BACK(1)(55)           <= ADPCM_DMA_EN;
+	SS_V_BACK(1)(56)           <= ADPCM_DMA_RUN;
+	SS_V_BACK(1)(57)           <= ADPCM_END;
+	SS_V_BACK(1)(58)           <= ADPCM_HALF;
+	SS_V_BACK(1)(59)           <= ADPCM_PLAY;
+	SS_V_BACK(1)(60)           <= ADPCM_WRITE_PEND;
+	SS_V_BACK(1)(61)           <= ADPCM_READ_PEND;
+	SS_V_BACK(1)(62)           <= PLAY_READ_PEND;
+	SS_V_BACK(1)(63)           <= DMA_WRITE_PEND;
+
+	SS_V_BACK(2)(16 downto 0)  <= ADPCM_RDADDR;
+	SS_V_BACK(2)(36 downto 20) <= ADPCM_WRADDR;
+	SS_V_BACK(2)(47 downto 40) <= ADPCM_RDDATA;
+	SS_V_BACK(2)(55 downto 48) <= ADPCM_WRDATA;
+	SS_V_BACK(2)(56)           <= ADPCM_WRITE_NIB;
+	SS_V_BACK(2)(57)           <= ADPCM_READ_NIB;
+	SS_V_BACK(2)(61 downto 58) <= M5205_D;
+
+	-- MSM5205 bit 38 is padding, not decoder state; CD owns bits 46:38.
+	SS_V_BACK(3)(37 downto 0)  <= M5205_SS_DOUT(37 downto 0);
+	SS_V_BACK(3)(46 downto 38) <= std_logic_vector(to_unsigned(M5205_CLK_CNT, 9));
+
+	SS_V_BACK(4)(7 downto 0)   <= std_logic_vector(FADE_CNT);
+	SS_V_BACK(4)(9 downto 8)   <= std_logic_vector(CD_BYTE_CNT);
+	SS_V_BACK(4)(10)           <= CDDA_SAMPLE;
+	SS_V_BACK(4)(11)           <= CDDA_SAMPLE_OLD;
+	SS_V_BACK(4)(15 downto 12) <= std_logic_vector(SUBCD_CNT);
+	SS_V_BACK(4)(23 downto 16) <= SUBCD_BYTE;
+	SS_V_BACK(4)(31 downto 24) <= std_logic_vector(SUBCD_BYTENUM);
+	SS_V_BACK(4)(32)           <= SUBCD_CE;
+	SS_V_BACK(4)(33)           <= SUBCD_CE_OLD;
+	SS_V_BACK(4)(34)           <= SUBCD_WR_OLD;
+	SS_V_BACK(4)(50 downto 35) <= std_logic_vector(OUTL);
+
+	SS_V_BACK(5)(15 downto 0)  <= std_logic_vector(OUTR);
+	SS_V_BACK(5)(26 downto 16) <= std_logic_vector(FADE_VOL);
+	SS_V_BACK(5)(58 downto 27) <= std_logic_vector(CDDA_CONSUMED);
+
+	GEN_SS_CD1 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CD_1, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout(0), SS_V_BACK(0), SS_V(0) );
+	GEN_SS_CD2 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CD_2, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout(1), SS_V_BACK(1), SS_V(1) );
+	GEN_SS_CD3 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CD_3, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout(2), SS_V_BACK(2), SS_V(2) );
+	GEN_SS_CD4 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CD_4, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout(3), SS_V_BACK(3), SS_V(3) );
+	GEN_SS_CD5 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CD_5, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout(4), SS_V_BACK(4), SS_V(4) );
+	GEN_SS_CD6 : entity work.eReg_SavestateV
+	generic map ( Adr => SSREG_INDEX_CD_6, def => SSREG_DEFAULT_CD )
+	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
+	           SaveStateBus_rst, SS_V_Dout(5), SS_V_BACK(5), SS_V(5) );
+
+	SaveStateBus_Dout <= SS_V_Dout(0) or SS_V_Dout(1) or SS_V_Dout(2)
+	                  or SS_V_Dout(3) or SS_V_Dout(4) or SS_V_Dout(5)
+	                  or SS_V_Dout_DBG68 or SS_V_Dout_DBG69 or SS_V_Dout_DBG70 or SS_V_Dout_DBG71
+	                  or SS_Dout_TAIL(0) or SS_Dout_TAIL(1) or SS_Dout_TAIL(2) or SS_Dout_TAIL(3)
+	                  or SS_Dout_TAIL(4) or SS_Dout_TAIL(5) or SS_Dout_TAIL(6) or SS_Dout_TAIL(7)
+	                  or SS_Dout_SCSI;
+
+	-- The boundary waits for a quiet SCSI, no pending ADPCM DMA write and the
+	-- end of the post-load audio hold. CDDA/subcode FIFO levels do not veto
+	-- it: Main delivers as fast as the DAC consumes, so a backlog left by a
+	-- freeze would never drain.
+	SS_CD_HOLD <= EN when SCSI_SS_QUIET = '0' or DMA_WRITE_PEND = '1' or AH = '1' else '0';
 
 end rtl;
