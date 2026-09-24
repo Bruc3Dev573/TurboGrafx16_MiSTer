@@ -2,8 +2,13 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use ieee.numeric_std.all;
 library work;
+use work.pBus_savestates.all;
+use work.pPCE_savestates.all;
 
 entity HUC6270 is
+	generic (
+		SS_BASE	: integer := 25		-- eReg slot base (see pce_savestates_pkg)
+	);
 	port( 
 		CLK		: in std_logic;
 		RST_N		: in std_logic;
@@ -64,7 +69,22 @@ entity HUC6270 is
 		HDE_DBG 				: out std_logic_vector(6 downto 0);
 		VDS_END_POS_DBG 	: out unsigned(9 downto 0);
 		VDISP_END_POS_DBG : out unsigned(9 downto 0);
-		VDE_END_POS_DBG 	: out unsigned(9 downto 0)
+		VDE_END_POS_DBG 	: out unsigned(9 downto 0);
+
+		-- Savestates
+		SaveStateBus_Din  : in  std_logic_vector(63 downto 0) := (others => '0');
+		SaveStateBus_Adr  : in  std_logic_vector(9 downto 0) := (others => '0');
+		SaveStateBus_wren : in  std_logic := '0';
+		SaveStateBus_rst  : in  std_logic := '0';
+		SaveStateBus_load : in  std_logic := '0';
+		SaveStateBus_Dout : out std_logic_vector(63 downto 0);
+		-- SAT walk (SAVETYPE_SAT0/SAT1): port B borrowed during freeze
+		SLEEP             : in  std_logic := '0';
+		SS_SAT_Addr       : in  std_logic_vector(8 downto 0) := (others => '0');	-- region byte addr; (8:1)=entry
+		SS_SAT_WrEn       : in  std_logic := '0';	-- strobed on odd byte with assembled 16-bit word
+		SS_SAT_WrData     : in  std_logic_vector(15 downto 0) := (others => '0');
+		SS_SAT_RdData     : out std_logic_vector(15 downto 0);
+		SS_DMA_BUSY       : out std_logic
 	);
 end HUC6270;
 
@@ -292,6 +312,16 @@ architecture rtl of HUC6270 is
 	signal CLR_A			: unsigned(7 downto 0);
 	signal CLR_WE			: std_logic;
 
+	--Savestates
+	signal RC_CNT_UPDATED	: std_logic;
+	type slv64_array10 is array (0 to 9) of std_logic_vector(63 downto 0);
+	signal SS_V      : slv64_array10;
+	signal SS_V_BACK : slv64_array10 := (others => (others => '0'));
+	signal SS_V_Dout : slv64_array10;
+	signal SAT_B_ADDR	: std_logic_vector(7 downto 0);
+	signal SAT_B_D		: std_logic_vector(15 downto 0);
+	signal SAT_B_WE	: std_logic;
+
 begin
 
 	process(CLK, RST_N)
@@ -307,6 +337,19 @@ begin
 			CM <= '0';
 			RES7M <= "0";
 		elsif rising_edge(CLK) then
+			if SaveStateBus_load = '1' then
+				-- FETCH_CE/FETCH_DOT are not restored: zeroed by reset_ss.
+				DOT_CNT     <= unsigned(SS_V(8)(2 downto 0));
+				TILE_CNT    <= unsigned(SS_V(8)(10 downto 4));
+				DOTS_REMAIN <= unsigned(SS_V(8)(46 downto 44));
+				TILE_ZERO   <= SS_V(8)(51);
+				HSW         <= SS_V(9)(4 downto 0);
+				HDS         <= SS_V(9)(14 downto 8);
+				HDW         <= SS_V(9)(22 downto 16);
+				HDE         <= SS_V(9)(30 downto 24);
+				CM          <= SS_V(5)(24);
+				RES7M       <= SS_V(8)(56 downto 56);
+			else
 
 			FETCH_CE <= not FETCH_CE;
 			if FETCH_CE = '1' then
@@ -348,6 +391,7 @@ begin
 			if DCK_CE = '0' and HSYNC_F = '1' then
 				RES7M <= "1";
 			end if; 
+			end if;	-- savestate load
 		end if;
 	end process;
 	
@@ -367,7 +411,6 @@ begin
 	
 	DISP_BREAK <= '1' when DISP_CNT_INC = '1' and HSYNC_F = '1' else '0';
 	process(CLK, RST_N)
-	variable RC_CNT_UPDATED : std_logic;
 	begin
 		if RST_N = '0' then
 			DISP_CNT <= (others=>'0');
@@ -377,7 +420,7 @@ begin
 			BG_FETCH <= '0';
 			BG_OUT <= '0';
 			RC_CNT <= "00"&x"40";
-			RC_CNT_UPDATED := '0';
+			RC_CNT_UPDATED <= '0';
 			
 			VSW <= (others=>'0');
 			VDS <= (others=>'0');
@@ -389,7 +432,26 @@ begin
 			BB <= '0';
 			SB <= '0';
 		elsif rising_edge(CLK) then
-			if DCK_CE = '1' then
+			if SaveStateBus_load = '1' then
+				-- BG_FETCH/BG_OUT are not restored: both 0 at the VBLANK boundary.
+				DISP_CNT         <= unsigned(SS_V(8)(25 downto 16));
+				RC_CNT           <= unsigned(SS_V(8)(41 downto 32));
+				RC_CNT_UPDATED   <= SS_V(8)(47);
+				DISP_CNT_INC     <= SS_V(8)(48);
+				DISP_BREAK_EN    <= SS_V(8)(49);
+				DISP_BREAK_LATCH <= SS_V(8)(50);
+				BURST            <= SS_V(8)(52);
+				VDISP            <= SS_V(8)(53);
+				VSW              <= SS_V(9)(36 downto 32);
+				VDS              <= SS_V(9)(45 downto 38);
+				VDW              <= SS_V(9)(55 downto 47);
+				VDE              <= SS_V(9)(63 downto 56);
+				SM               <= SS_V(5)(26 downto 25);
+				VM               <= SS_V(5)(28 downto 27);
+				SCREEN           <= SS_V(5)(31 downto 29);
+				BB               <= SS_V(5)(32);
+				SB               <= SS_V(5)(33);
+			elsif DCK_CE = '1' then
 				if VSYNC_F = '1' then
 					VDISP <= '0';
 					DISP_CNT <= (others=>'0');
@@ -460,10 +522,10 @@ begin
 					end if; 
 				end if;
 				if DISP_BREAK = '1' then
-					RC_CNT_UPDATED := '0';
+					RC_CNT_UPDATED <= '0';
 				end if;
 				if TILE_CNT = HDISP_END_POS and DOT_CNT = 7 then
-					RC_CNT_UPDATED := '1';
+					RC_CNT_UPDATED <= '1';
 				end if;
 				
 				if TILE_CNT = HDS_END_POS - 3 and DOT_CNT = 6 then
@@ -673,7 +735,10 @@ begin
 			BG_SR3 <= (others=>'0');
 			BG_SRC <= (others=>(others=>'0'));
 		elsif rising_edge(CLK) then
-			if DCK_CE = '1' then
+			if SaveStateBus_load = '1' then
+				-- OFS_X restores from BXR; OFS_Y reloads from BYR at DISP_CNT=VDS_END_POS+1.
+				OFS_X <= unsigned(SS_V(1)(57 downto 48));
+			elsif DCK_CE = '1' then
 				case SLOT is
 					when BAT =>
 						BG_BAT_CC <= RAM_DI(11 downto 0);
@@ -734,6 +799,13 @@ begin
 	DMAS_SAT_WE <= DCK_CE when DMAS_EXEC = '1' and SLOT = CPU else '0'; 
 	SAT_ADDR <= std_logic_vector(SPR_EVAL_X) when CLR_WE = '0' else std_logic_vector(CLR_A);
 	
+	-- The SAT walk borrows port B while frozen; sprite eval is idle during SLEEP and
+	-- q_b re-primes from SPR_EVAL_X on unfreeze before the next evaluation window.
+	SAT_B_ADDR <= SS_SAT_Addr(8 downto 1) when SLEEP = '1' else SAT_ADDR;
+	SAT_B_D    <= SS_SAT_WrData           when SLEEP = '1' else (others => '0');
+	SAT_B_WE   <= SS_SAT_WrEn             when SLEEP = '1' else CLR_WE;
+	SS_SAT_RdData <= SAT_Q;
+
 	SAT : entity work.dpram generic map (8,16)
 	port map(
 		clock		=> CLK,
@@ -742,9 +814,9 @@ begin
 		address_a=> DMAS_SAT_ADDR,
 		wren_a	=> DMAS_SAT_WE,
 		
-		address_b=> SAT_ADDR,
-		data_b   => (others => '0'),
-		wren_b   => CLR_WE,
+		address_b=> SAT_B_ADDR,
+		data_b   => SAT_B_D,
+		wren_b   => SAT_B_WE,
 		q_b		=> SAT_Q
 	);
 
@@ -791,7 +863,7 @@ begin
 			SPR_EVAL_FULL <= '0';
 			SPR_EVAL_CNT <= (others=>'0');
 			SPR_FIND <= '0';
-			SPR_CACHE <= (others=>((others=>'0'),(others=>'0'),(others=>'0'),'0',"00",'0','0',"00",'0','0','0','0','0'));
+			SPR_CACHE <= (others=>((others=>'0'),(others=>'0'),(others=>'0'),'0',"0000",'0','0',"00",'0','0','0','0','0'));
 			SPR_Y <= (others=>'0');
 			SPR_X <= (others=>'0');
 			SPR_PC <= (others=>'0');
@@ -816,6 +888,10 @@ begin
 			SPR_TILE_SAVE <= '0';
 			IRQ_OVF <= '0';
 		elsif rising_edge(CLK) then
+			if SaveStateBus_load = '1' then
+				-- Only IRQ_OVF persists; the sprite evaluator/fetcher is rebuilt after reset_ss.
+				IRQ_OVF <= SS_V(5)(40);
+			else
 			SPR_TILE_SAVE <= '0';
 			if DCK_CE = '1' then
 				if TILE_CNT = HDS_END_POS and DOT_CNT = 3 and DISP_CNT >= VDS_END_POS and DISP_CNT < VDISP_END_POS then
@@ -969,6 +1045,7 @@ begin
 			if CS_N = '0' and RD_N = '0' and CPU_CE = '1' and A(1) = '0' and (BYTEWORD = '0' or A(0) = '0') then
 				IRQ_OVF <= '0';						
 			end if; 
+			end if;	-- savestate load
 		end if;
 	end process;
 	
@@ -984,10 +1061,15 @@ begin
 			SPR_LINE_WE <= (others=>'0');
 			SPR_TILE_PIX_SET <= (others=>'0');
 			SPR_TILE_SPR0_SET <= (others=>'0');
+			SPR_TILE_FRAME <= (others=>'0');
 			SPR_OUT_X <= (others=>'0');
 			SPR_LINE_CLR <= '0';
 			IRQ_COL <= '0';
 		elsif rising_edge(CLK) then
+			if SaveStateBus_load = '1' then
+				-- Only IRQ_COL persists; line buffers and pixel bitmaps are rebuilt.
+				IRQ_COL <= SS_V(5)(39);
+			else
 			SPR_LINE_WE <= (others=>'0');
 			if SPR_TILE_SAVE = '1' or SPR_TILE_PIX /= 0 then
 				for i in 0 to 1 loop
@@ -1009,8 +1091,10 @@ begin
 						end if; 
 					end if;
 
-					if (SPR_TILE_PIX = 0 and SPR_TILE_LEFT = '1') or (SPR_TILE_PIX = 15 and SPR_TILE_RIGTH = '1') or 
-						SPR_TILE_TOP = '1' or SPR_TILE_BOTTOM = '1' then
+					-- Same range guard as the PIX_SET write above: off-screen X must not index past the buffer.
+					if SPR_LINE_X(9 downto 8) /= "11" and
+						((SPR_TILE_PIX = 0 and SPR_TILE_LEFT = '1') or (SPR_TILE_PIX = 15 and SPR_TILE_RIGTH = '1') or
+						SPR_TILE_TOP = '1' or SPR_TILE_BOTTOM = '1') then
 						SPR_TILE_FRAME(to_integer(SPR_LINE_X)) <= '1';
 					end if; 
 
@@ -1037,6 +1121,7 @@ begin
 			if CS_N = '0' and RD_N = '0' and CPU_CE = '1' and A(1) = '0' and (BYTEWORD = '0' or A(0) = '0') then
 				IRQ_COL <= '0';
 			end if; 
+			end if;	-- savestate load
 		end if;
 	end process;
 	
@@ -1175,6 +1260,47 @@ begin
 			BYRH_SET <= '0';
 			VDISP_OLD <= '0';
 		elsif rising_edge(CLK) then
+			if SaveStateBus_load = '1' then
+				-- REGS(20..31) are never read back: not saved, reset to 0.
+				for k in 0 to 4 loop
+					REGS(k*4+0) <= SS_V(k)(15 downto 0);
+					REGS(k*4+1) <= SS_V(k)(31 downto 16);
+					REGS(k*4+2) <= SS_V(k)(47 downto 32);
+					REGS(k*4+3) <= SS_V(k)(63 downto 48);
+				end loop;
+				AR             <= SS_V(5)(4 downto 0);
+				VRR            <= SS_V(5)(23 downto 8);
+				IRQ_DMA        <= SS_V(5)(38);
+				IRQ_RCR        <= SS_V(5)(41);
+				IRQ_DMAS       <= SS_V(5)(42);
+				IRQ_VBL        <= SS_V(5)(43);
+				CPU_BUSY       <= SS_V(5)(52);
+				CPU_BUSY_CLEAR <= SS_V(5)(53);
+				CPURD_PEND     <= SS_V(6)(0);
+				CPUWR_PEND     <= SS_V(6)(1);
+				CPURD_PEND2    <= SS_V(6)(2);
+				CPUWR_PEND2    <= SS_V(6)(3);
+				CPURD_EXEC     <= SS_V(6)(4);
+				CPUWR_EXEC     <= SS_V(6)(5);
+				CPU_VRAM_ADDR  <= SS_V(6)(21 downto 6);
+				CPU_VRAM_DATA  <= SS_V(6)(37 downto 22);
+				IO_BYRL_SET    <= SS_V(6)(38);
+				IO_BYRH_SET    <= SS_V(6)(39);
+				IO_BYRL_WR     <= SS_V(6)(40);
+				IO_BYRH_WR     <= SS_V(6)(41);
+				BXR_SET        <= SS_V(6)(42);
+				BYRL_SET       <= SS_V(6)(43);
+				BYRH_SET       <= SS_V(6)(44);
+				DMA_PEND       <= SS_V(7)(0);
+				DMA_EXEC       <= SS_V(7)(1);
+				DMA_WR         <= SS_V(7)(2);
+				DMA_BUF        <= SS_V(7)(18 downto 3);
+				DMAS_PEND      <= SS_V(7)(19);
+				DMAS_EXEC      <= SS_V(7)(20);
+				DMAS_SAT_ADDR  <= SS_V(7)(31 downto 24);
+				DMAS_VRAM_ADDR <= SS_V(7)(47 downto 32);
+				VDISP_OLD      <= SS_V(8)(54);
+			else
 			IO_BYRL_WR <= '0';
 			IO_BYRH_WR <= '0';
 			if CS_N = '0' and WR_N = '0' and CPU_CE = '1' then
@@ -1421,6 +1547,7 @@ begin
 					BYRH_SET <= '1';
 				end if;
 			end if;
+			end if;	-- savestate load
 		end if;
 	end process;
 	
@@ -1430,9 +1557,14 @@ begin
 			SR_LATCH <= (others=>'0');
 			RD_N_OLD <= '1';
 		elsif rising_edge(CLK) then
+			if SaveStateBus_load = '1' then
+				SR_LATCH <= SS_V(5)(50 downto 44);
+				RD_N_OLD <= SS_V(8)(55);
+			else
 			RD_N_OLD <= RD_N;
 			if RD_N = '0' and RD_N_OLD = '1' then
 				SR_LATCH <= CPU_BUSY & IRQ_VBL & IRQ_DMA & IRQ_DMAS & IRQ_RCR & IRQ_OVF & IRQ_COL;
+				end if;
 			end if;
 		end if;
 	end process;
@@ -1518,4 +1650,110 @@ begin
 	VDISP_END_POS_DBG <= VDISP_END_POS;
 	VDE_END_POS_DBG <= VDE_END_POS;
 	
+	-- Savestates
+	-- Not saved (zeroed by reset_ss, rebuilt from VRAM+SAT+registers before unfreeze):
+	-- sprite eval/fetch, line buffers, BG pipeline, OFS_Y, FETCH_DOT/FETCH_CE/SLOT.
+
+	GEN_SS_REGS_BACK : for k in 0 to 4 generate
+		SS_V_BACK(k)(15 downto 0)  <= REGS(k*4+0);
+		SS_V_BACK(k)(31 downto 16) <= REGS(k*4+1);
+		SS_V_BACK(k)(47 downto 32) <= REGS(k*4+2);
+		SS_V_BACK(k)(63 downto 48) <= REGS(k*4+3);
+	end generate;
+
+	SS_V_BACK(5)(4 downto 0)   <= AR;
+	SS_V_BACK(5)(23 downto 8)  <= VRR;
+	SS_V_BACK(5)(24)           <= CM;
+	SS_V_BACK(5)(26 downto 25) <= SM;
+	SS_V_BACK(5)(28 downto 27) <= VM;
+	SS_V_BACK(5)(31 downto 29) <= SCREEN;
+	SS_V_BACK(5)(32)           <= BB;
+	SS_V_BACK(5)(33)           <= SB;
+	SS_V_BACK(5)(38)           <= IRQ_DMA;
+	SS_V_BACK(5)(39)           <= IRQ_COL;
+	SS_V_BACK(5)(40)           <= IRQ_OVF;
+	SS_V_BACK(5)(41)           <= IRQ_RCR;
+	SS_V_BACK(5)(42)           <= IRQ_DMAS;
+	SS_V_BACK(5)(43)           <= IRQ_VBL;
+	SS_V_BACK(5)(50 downto 44) <= SR_LATCH;
+	SS_V_BACK(5)(52)           <= CPU_BUSY;
+	SS_V_BACK(5)(53)           <= CPU_BUSY_CLEAR;
+
+	SS_V_BACK(6)(0)            <= CPURD_PEND;
+	SS_V_BACK(6)(1)            <= CPUWR_PEND;
+	SS_V_BACK(6)(2)            <= CPURD_PEND2;
+	SS_V_BACK(6)(3)            <= CPUWR_PEND2;
+	SS_V_BACK(6)(4)            <= CPURD_EXEC;
+	SS_V_BACK(6)(5)            <= CPUWR_EXEC;
+	SS_V_BACK(6)(21 downto 6)  <= CPU_VRAM_ADDR;
+	SS_V_BACK(6)(37 downto 22) <= CPU_VRAM_DATA;
+	SS_V_BACK(6)(38)           <= IO_BYRL_SET;
+	SS_V_BACK(6)(39)           <= IO_BYRH_SET;
+	SS_V_BACK(6)(40)           <= IO_BYRL_WR;
+	SS_V_BACK(6)(41)           <= IO_BYRH_WR;
+	SS_V_BACK(6)(42)           <= BXR_SET;
+	SS_V_BACK(6)(43)           <= BYRL_SET;
+	SS_V_BACK(6)(44)           <= BYRH_SET;
+
+	SS_V_BACK(7)(0)            <= DMA_PEND;
+	SS_V_BACK(7)(1)            <= DMA_EXEC;
+	SS_V_BACK(7)(2)            <= DMA_WR;
+	SS_V_BACK(7)(18 downto 3)  <= DMA_BUF;
+	SS_V_BACK(7)(19)           <= DMAS_PEND;
+	SS_V_BACK(7)(20)           <= DMAS_EXEC;
+	SS_V_BACK(7)(31 downto 24) <= DMAS_SAT_ADDR;
+	SS_V_BACK(7)(47 downto 32) <= DMAS_VRAM_ADDR;
+
+	SS_V_BACK(8)(2 downto 0)   <= std_logic_vector(DOT_CNT);
+	SS_V_BACK(8)(10 downto 4)  <= std_logic_vector(TILE_CNT);
+	SS_V_BACK(8)(25 downto 16) <= std_logic_vector(DISP_CNT);
+	SS_V_BACK(8)(41 downto 32) <= std_logic_vector(RC_CNT);
+	SS_V_BACK(8)(46 downto 44) <= std_logic_vector(DOTS_REMAIN);
+	SS_V_BACK(8)(47)           <= RC_CNT_UPDATED;
+	SS_V_BACK(8)(48)           <= DISP_CNT_INC;
+	SS_V_BACK(8)(49)           <= DISP_BREAK_EN;
+	SS_V_BACK(8)(50)           <= DISP_BREAK_LATCH;
+	SS_V_BACK(8)(51)           <= TILE_ZERO;
+	SS_V_BACK(8)(52)           <= BURST;
+	SS_V_BACK(8)(53)           <= VDISP;
+	SS_V_BACK(8)(54)           <= VDISP_OLD;
+	SS_V_BACK(8)(55)           <= RD_N_OLD;
+	SS_V_BACK(8)(56 downto 56) <= RES7M;
+
+	SS_V_BACK(9)(4 downto 0)   <= HSW;
+	SS_V_BACK(9)(14 downto 8)  <= HDS;
+	SS_V_BACK(9)(22 downto 16) <= HDW;
+	SS_V_BACK(9)(30 downto 24) <= HDE;
+	SS_V_BACK(9)(36 downto 32) <= VSW;
+	SS_V_BACK(9)(45 downto 38) <= VDS;
+	SS_V_BACK(9)(55 downto 47) <= VDW;
+	SS_V_BACK(9)(63 downto 56) <= VDE;
+
+	GEN_SS_EREGS : for k in 0 to 9 generate
+		iSS_VDC : entity work.eReg_SavestateV
+		generic map ( Adr => SS_BASE + k, def => SSREG_DEFAULT_VDC )
+		port map (
+			clk      => CLK,
+			BUS_Din  => SaveStateBus_Din,
+			BUS_Adr  => SaveStateBus_Adr,
+			BUS_wren => SaveStateBus_wren,
+			BUS_rst  => SaveStateBus_rst,
+			BUS_Dout => SS_V_Dout(k),
+			Din      => SS_V_BACK(k),
+			Dout     => SS_V(k)
+		);
+	end generate;
+
+	process( SS_V_Dout )
+		variable d : std_logic_vector(63 downto 0);
+	begin
+		d := (others => '0');
+		for k in 0 to 9 loop
+			d := d or SS_V_Dout(k);
+		end loop;
+		SaveStateBus_Dout <= d;
+	end process;
+
+	SS_DMA_BUSY <= DMA_EXEC or DMAS_EXEC;
+
 end rtl;
