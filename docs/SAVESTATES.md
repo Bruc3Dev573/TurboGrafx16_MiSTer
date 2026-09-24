@@ -196,3 +196,29 @@ https://github.com/Bruc3Dev573/Main_MiSTer: MiSTer Main commit
 reply; this Main then pauses its timed sector delivery, keeps serving the
 command mailbox, and resumes on its pre-freeze schedule. It also loads and
 writes CD slots on SD under the disc's name when a CD is mounted.
+
+## Standalone simulations
+
+Run from the repository root with Bash and GHDL (mcode). The Arcade register
+check also needs Verilator, GNU `timeout` and a C++ toolchain; the UI check
+uses Icarus Verilog. The benches stub the Altera memories and use synthetic
+programs and disc models: no BIOS or game image is needed.
+
+|Command|Coverage|
+|---|---|
+|`bash sim/analyze_all.sh`|GHDL analysis of the whole VHDL tree|
+|`bash sim/run_tb.sh`|Engine roundtrip, refusal, queued requests, counter rollover, SD option|
+|`bash sim/run_statemanager.sh`|Request queues, slot capture, acknowledgement and cancellation|
+|`bash sim/run_ssui.sh`|Keyboard modifiers, slot selection and completion notices|
+|`bash sim/run_tb_brm.sh`|Backup RAM roundtrip|
+|`bash sim/run_tb_adpcm.sh`|ADPCM unit: divider phase and first-sample timing|
+|`bash sim/run_tb_core.sh`|Whole core: determinism after a load, Main pause modelled|
+|`bash sim/run_tb_cd.sh`|CD subsystem save/load matrix (hours)|
+|`bash sim/run_tb_cd_fast.sh`|CDDA sample-exact resume, loop wrap and backup RAM only (minutes)|
+|`bash sim/run_tb_cd_w.sh`, `_w2.sh`, `_w3.sh`|Save/load inside streaming READ6 on push-status and Main-accurate drive models|
+|`bash sim/run_cd_subcode_resume.sh`|CDDA/subcode resume, delayed FIFO data, in-flight burst, persistent backlog|
+|`bash sim/run_cd_audio_hold.sh`|Post-load audio hold: resume, abandon, no hold, watchdog, fast-seek bit|
+|`bash sim/run_arcade_memory.sh`|Arcade RAM roundtrip through the engine and shared bridge|
+|`bash sim/run_arcade_snapshot.sh`|Arcade registers with the production savestate registers|
+
+These are source-level checks, not a substitute for hardware testing.
