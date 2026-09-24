@@ -21,36 +21,44 @@
 module hps_ext
 (
 	input             clk_sys,
+	input             cd_hold,
 	inout      [35:0] EXT_BUS,
 
 	// CD interface
 	input      [112:0] cd_in,
-	output reg [112:0] cd_out
+	output reg [112:0] cd_out,
+	output reg        cd_reset_done = 0
  );
 
+reg [15:0] io_dout;
+reg        dout_en = 0;
+reg  [4:0] byte_cnt;
 assign EXT_BUS[15:0] = io_dout;
 wire [15:0] io_din = EXT_BUS[31:16];
 assign EXT_BUS[32] = dout_en;
 wire io_strobe = EXT_BUS[33];
 wire io_enable = EXT_BUS[34];
 
-localparam EXT_CMD_MIN = CD_GET;
-localparam EXT_CMD_MAX = CD_SET;
 
 localparam CD_GET = 'h34;
 localparam CD_SET = 'h35;
+localparam EXT_CMD_MIN = CD_GET;
+localparam EXT_CMD_MAX = CD_SET;
 
-reg [15:0] io_dout;
-reg        dout_en = 0;
-reg  [4:0] byte_cnt;
 
 always@(posedge clk_sys) begin
 	reg [15:0] cmd;
 	reg  [7:0] cd_req = 0;
 	reg        old_cd = 0; 
+	reg  [7:0] fetch_req;
+	reg        fetch_toggle;
+	reg        fetch_valid = 0;
+	reg        reset_armed = 0;
+	reg        reset_reported = 0;
 
 	old_cd <= cd_in[112];
 	if(old_cd ^ cd_in[112]) cd_req <= cd_req + 1'd1;
+	cd_reset_done <= 0;
 
 	if(~io_enable) begin
 		dout_en <= 0;
@@ -58,6 +66,11 @@ always@(posedge clk_sys) begin
 		byte_cnt <= 0;
 		cmd <= 0;
 		if(cmd == CD_SET) cd_out[112] <= ~cd_out[112]; 
+		// Arm reset completion only after a complete, unchanged kind-FF fetch.
+		if(cmd == CD_GET && byte_cnt >= 8 && fetch_valid &&
+		   fetch_req == cd_req && fetch_toggle == cd_in[112] &&
+		   old_cd == cd_in[112] && cd_in[111:96] == 16'h00FF &&
+		   !reset_reported) reset_armed <= 1;
 	end
 	else if(io_strobe) begin
 
@@ -67,7 +80,20 @@ always@(posedge clk_sys) begin
 		if(byte_cnt == 0) begin
 			cmd <= io_din;
 			dout_en <= (io_din >= EXT_CMD_MIN && io_din <= EXT_CMD_MAX);
-			if(io_din == CD_GET) io_dout <= cd_req; 
+			if(io_din == CD_GET) begin
+				// Main pauses timed sector delivery while consumers are frozen.
+				io_dout <= {7'd0, cd_hold, cd_req};
+				fetch_req <= cd_req;
+				fetch_toggle <= cd_in[112];
+				fetch_valid <= 1;
+				// The next HPS poll begins after its synchronous reset returns.
+				if(reset_armed && fetch_req == cd_req &&
+				   fetch_toggle == cd_in[112] && old_cd == cd_in[112]) begin
+					cd_reset_done <= 1;
+					reset_reported <= 1;
+				end
+				reset_armed <= 0;
+			end
 		end else begin
 
 			case(cmd)
@@ -93,6 +119,14 @@ always@(posedge clk_sys) begin
 						endcase 
 			endcase
 		end
+	end
+
+	// Includes a mailbox change on the very edge ending or starting GET:
+	// cd_req has not incremented yet, so generation equality alone is unsafe.
+	if(old_cd != cd_in[112]) begin
+		fetch_valid <= 0;
+		reset_armed <= 0;
+		reset_reported <= 0;
 	end
 end
 

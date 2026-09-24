@@ -75,11 +75,11 @@ video_freak video_freak
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXX XXXXXXXXXXXXXXXXXXXXXXXXXX  XXXXXXX
+// XXXX XXXXXXXXXXXXXXXXXXXXXXXXXX  XXXXXXX   XXXXX
 
 `include "build_id.v"
 parameter CONF_STR = {
-	"TGFX16;;",
+	"TGFX16;SS3E000000:300000;",	// savestate scratch: 4 slots x 3MB at DDR3 0x3E000000 (NES-style token)
 	"FS0,PCEBIN,Load TurboGrafx;",
 `ifndef DEBUG_BUILD
 	"FS1,SGX,Load SuperGrafx;",
@@ -137,8 +137,31 @@ parameter CONF_STR = {
 	"H5OTU,Controller,2 Buttons,2 Turbo,6 Buttons;",
 	"H5OQR,Special,None,Mouse,Pachinko,XE-1AP;",
 	"H5-;",
+	"-;",
+	"oC,Savestates to SDCard,On,Off;",
+	"oDE,Savestate Slot,1,2,3,4;",
+	"d7rA,Save state(Alt+F1-F4);",
+	"d7rB,Restore state(F1-F4);",
+	"-;",
 	"R0,Reset;",
-	"J1,Button I,Button II,Select,Run,Button III,Button IV,Button V,Button VI;",
+	"I,,",
+	",",
+	",",
+	",",
+	"Slot=DPAD|Save=Select+Down|Load=Select+Up,",
+	"Active Slot 1,",
+	"Active Slot 2,",
+	"Active Slot 3,",
+	"Active Slot 4,",
+	"Save to state 1,",
+	"Restore state 1,",
+	"Save to state 2,",
+	"Restore state 2,",
+	"Save to state 3,",
+	"Restore state 3,",
+	"Save to state 4,",
+	"Restore state 4;",
+	"J1,Button I,Button II,Select,Run,Button III,Button IV,Button V,Button VI,Savestates;",
 	"jn,A,B,Select,Start,X,Y,L,R;",
 	"jp,A,B,Select,Start,L,R,Y,X;",
 	"V,v",`BUILD_DATE
@@ -184,7 +207,7 @@ pll pll
 wire [63:0] status;
 wire  [1:0] buttons;
 
-wire [11:0] joy_0, joy_1, joy_2, joy_3, joy_4;
+wire [12:0] joy_0, joy_1, joy_2, joy_3, joy_4;	// [12] = Savestates button (not visible to the game)
 wire [15:0] joy_a, joy_b;
 wire  [7:0] pd_0;
 
@@ -222,7 +245,11 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({en216p, snac, 1'd1, use_sdr, ~use_sdr, ~gg_avail,~bk_ena}),
+	.status_menumask({ss_avail, en216p, snac, 1'd1, use_sdr, ~use_sdr, ~gg_avail,~bk_ena}),	// bit7 = d7 savestate gate
+	.status_in({64'd0, status[63:47], ss_slot, status[44:0]}),
+	.status_set(ss_statusUpdate),
+	.info_req(ss_info_req),
+	.info(ss_info),
 	.forced_scandoubler(forced_scandoubler),
 
 	.sdram_sz(sdram_sz),
@@ -267,6 +294,68 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 
 wire reset = (RESET | status[0] | buttons[1] | bk_loading);
 
+///////////////////////////// savestates /////////////////////////////////
+
+wire [63:0] ss_ddr_din, ss_ddr_dout;
+wire [25:0] ss_ddr_adr;		// DWORD address from pce_top/savestates
+wire  [7:0] ss_ddr_be;
+wire        ss_ddr_rnw, ss_ddr_ena, ss_ddr_done;
+wire        ss_sleep;
+
+wire  [1:0] ss_slot;
+wire  [7:0] ss_info;
+wire        ss_save, ss_load, ss_info_req;
+wire        ss_statusUpdate;
+wire        ss_busy, ss_failed;
+wire  [1:0] ss_active_slot;
+wire        ss_active_load;
+
+// SaveStateBus export from pce_top for the SV-side TOP_EXT eReg (slot 47)
+wire [63:0] sse_din, sse_dout_ext;
+wire  [9:0] sse_adr;
+wire        sse_wren, sse_rst, sse_load;
+wire [63:0] ss_top_ext;
+wire  [8:0] ss_dbg;		// boundary-block telemetry from pce_top
+wire        ss_ac_used;	// game actually touched the Arcade Card
+
+reg rom_loaded = 0;
+always @(posedge clk_sys) if (cart_download) rom_loaded <= 1;
+
+// Enabled MB128 blocks immediately, before the session latch is clocked.
+wire ss_inhibit = mb128_ena | mb128_ss_blocked;
+
+// Arcade Card RAM and registers are included when the game has used the card.
+// bk_state also excludes the SAVE half: the backup RAM is a dual-port shared
+// with the HPS buffer, so a savestate walk running while the .sav streams out
+// would hand the host a half-restored image.
+wire ss_avail = (rom_loaded | cd_en) & ~bk_loading & ~bk_state
+              & ~ss_inhibit;
+
+savestate_ui savestate_ui
+(
+	.clk            (clk_sys       ),
+	.ps2_key        (ps2_key       ),
+	.allow_ss       (ss_avail      ),
+	.joySS          (joy_0[12]     ),	// J1 "Savestates" button (NES pattern)
+	.joyRight       (joy_0[0]      ),
+	.joyLeft        (joy_0[1]      ),
+	.joyDown        (joy_0[2]      ),
+	.joyUp          (joy_0[3]      ),
+	.status_slot    (status[46:45] ),
+	.OSD_saveload   (status[43:42] ),
+	.ss_save        (ss_save       ),
+	.ss_load        (ss_load       ),
+	.ss_info_req    (ss_info_req   ),
+	.ss_info        (ss_info       ),
+	.ss_busy        (ss_busy       ),
+	.ss_failed      (ss_failed     ),
+	.ss_active_slot (ss_active_slot),
+	.ss_active_load (ss_active_load),
+	.statusUpdate   (ss_statusUpdate),
+	.selected_slot  (ss_slot       )
+);
+defparam savestate_ui.INFO_TIMEOUT_BITS = 25;
+
 `ifdef DEBUG_PALETTES
 wire palette_download = ioctl_download & (ioctl_index[5:0] == 6'h03 || (ioctl_index[7:6] == 1 && ~|ioctl_index));
 `endif
@@ -289,6 +378,8 @@ reg         cd_dataout_req;
 wire [79:0] cd_dataout;
 wire        cd_dataout_send;
 wire        cd_reset_req;
+wire        cd_reset_done;
+wire        cd_fast_seek;
 reg         cd_region;
 
 wire [21:0] cd_ram_a;
@@ -299,12 +390,42 @@ wire        ce_rom;
 
 wire [15:0] cdda_sl, cdda_sr, adpcm_s, psg_sl, psg_sr;
 
-pce_top #(LITE) pce_top
+// Named association: pce_top's first generic is SS_CDRAM_BYTES, not LITE.
+// Positional #(LITE) would set it to 0 and drop the CD work RAM from the
+// savestate.
+pce_top #(.LITE(LITE)) pce_top
 (
 	.RESET(reset|cart_download),
 	.COLD_RESET(cart_download),
 
 	.CLK(clk_sys),
+
+	.SS_SAVE(ss_save),
+	.SS_LOAD(ss_load),
+	.SS_SLOT(ss_slot),
+	.SS_BUSY(ss_busy),
+	.SS_FAILED(ss_failed),
+	.SS_ACTIVE_SLOT(ss_active_slot),
+	.SS_ACTIVE_LOAD(ss_active_load),
+	.SS_SLEEP(ss_sleep),
+	.SS_DDR_DIN(ss_ddr_din),
+	.SS_DDR_DOUT(ss_ddr_dout),
+	.SS_DDR_ADDR(ss_ddr_adr),
+	.SS_DDR_RNW(ss_ddr_rnw),
+	.SS_DDR_ENA(ss_ddr_ena),
+	.SS_DDR_BE(ss_ddr_be),
+	.SS_DDR_DONE(ss_ddr_done),
+	.SS_EXT_HOLD(mb128_ena & ~mb128_Idle),
+	.SS_INHIBIT(ss_inhibit),
+	.SS_TO_SD(~status[44]),
+	.SSE_Din(sse_din),
+	.SSE_Adr(sse_adr),
+	.SSE_wren(sse_wren),
+	.SSE_rst(sse_rst),
+	.SSE_load(sse_load),
+	.SSE_Dout(sse_dout_ext),
+	.SS_DBG(ss_dbg),
+	.SS_AC_USED(ss_ac_used),
 
 	.ROM_RD(rom_rd),
 	.ROM_RDY(rom_sdrdy & rom_ddrdy & ram_ddrdy),
@@ -352,6 +473,8 @@ pce_top #(LITE) pce_top
 
 	.CD_REGION(cd_region),
 	.CD_RESET(cd_reset_req),
+	.CD_RESET_DONE(cd_reset_done),
+	.CD_FAST_SEEK(cd_fast_seek),
 
 	.CD_DATA(!cd_dat_byte ? cd_dat[7:0] : cd_dat[15:8]),
 	.CD_DATA_WR(cd_data_wr),
@@ -394,9 +517,11 @@ wire [112:0] cd_out;
 hps_ext hps_ext
 (
 	.clk_sys(clk_sys),
+	.cd_hold(ss_sleep),
 	.EXT_BUS(EXT_BUS),
 	.cd_in(cd_in),
-	.cd_out(cd_out)
+	.cd_out(cd_out),
+	.cd_reset_done(cd_reset_done)
 );
 
 reg cd_en = 0;
@@ -429,9 +554,13 @@ always @(posedge clk_sys) begin
 		cd_dataout_send_old <= cd_dataout_send;
 		cd_dat_req_old <= cd_dat_req;
 		cd_reset_req_old <= cd_reset_req;
-		if (cd_comm_send && !cd_comm_send_old) begin
+		if (cd_reset_req && !cd_reset_req_old) begin
+			cd_in[111:96] <= 16'h00FF;
+			cd_in[112] <= ~cd_in[112];
+		end
+		else if (cd_comm_send && !cd_comm_send_old) begin
 			cd_in[95:0] <= cd_comm;
-			cd_in[111:96] <= {status[1],15'd0};
+			cd_in[111:96] <= {status[1] | cd_fast_seek,15'd0};
 			cd_in[112] <= ~cd_in[112];
 		end
 		else if (cd_dataout_send && !cd_dataout_send_old) begin
@@ -441,10 +570,6 @@ always @(posedge clk_sys) begin
 		end
 		else if (cd_dat_req && !cd_dat_req_old) begin
 			cd_in[111:96] <= 16'h0002;
-			cd_in[112] <= ~cd_in[112];
-		end
-		else if (cd_reset_req && !cd_reset_req_old) begin
-			cd_in[111:96] <= 16'h00FF;
 			cd_in[112] <= ~cd_in[112];
 		end
 	end
@@ -747,7 +872,17 @@ ddram ddram
 	.rdaddr(rom_rd ? {3'b000,(rom_rdaddr + (romwr_a[9] ? 22'h200 : 22'h0))} : {3'b001,cd_ram_a}),
 	.rd(~use_sdr & (rom_rd | cd_ram_rd) & ce_rom),
 	.rd_rdy(rom_ddrdy),
-	.dout(rom_ddata)
+	.dout(rom_ddata),
+
+	// savestate channel (64-bit, cache-bypass). {DWORD addr, 1'b0} -> 16-bit-word addr;
+	// byte address = ss_ddr_adr*4 = 0x0E000000+ -> DDR3 0x3E000000+ (window base 0x30000000).
+	.ch1_addr({ss_ddr_adr, 1'b0}),
+	.ch1_din(ss_ddr_din),
+	.ch1_dout(ss_ddr_dout),
+	.ch1_req(ss_ddr_ena),
+	.ch1_rnw(ss_ddr_rnw),
+	.ch1_be(ss_ddr_be),
+	.ch1_ready(ss_ddr_done)
 );
 
 sdram sdram
@@ -849,13 +984,24 @@ end
 
 ////////////////////////////  INPUT  ///////////////////////////////////
 
+// Suppress player 1 directions during savestate commands. Keep a short
+// hold-off so releasing the modifier first does not leak a held direction.
+// Other buttons, controllers and mouse input remain unchanged.
+reg  [19:0] ss_combo_tail = 0;
+wire        ss_combo_hold = joy_0[12] | (ss_combo_tail != 0);
+always @(posedge clk_sys) begin
+	if (joy_0[12]) ss_combo_tail <= 20'd530000;   // ~10 ms at 53.something MHz
+	else if (ss_combo_tail != 0) ss_combo_tail <= ss_combo_tail - 1'd1;
+end
+wire [12:0] joy_0_game = ss_combo_hold ? (joy_0 & ~13'h0FFF) : joy_0;
+
 wire [15:0] joy_data;
 always_comb begin
 	case (joy_port)
 		0: joy_data = (status[27:26] == 2'b01) ? {mouse_data, mouse_data} :
 						  (status[27:26] == 2'b11) ? {xe1_data[2], xe1_data[1], xe1_data[3], xe1_data[0], xe1_runbtn, xe1_selbtn, xe1_trg2, xe1_trg1,
 																xe1_data[2], xe1_data[1], xe1_data[3], xe1_data[0], xe1_runbtn, xe1_selbtn, xe1_trg2, xe1_trg1} :
-						                            ~{4'hF, joy_0[11:8], joy_0[1], joy_0[2], joy_0[0], joy_0[3], joy_0[7:6], (status[30:29] == 2'b01) ? joyrept_0[1:0] : joy_0[5:4]};
+						                            ~{4'hF, joy_0[11:8], joy_0_game[1], joy_0_game[2], joy_0_game[0], joy_0_game[3], joy_0[7:6], (status[30:29] == 2'b01) ? joyrept_0[1:0] : joy_0[5:4]};
 															  
 		1: joy_data = (status[27:26] == 2'b10) ? pachinko                 : ~{4'hF, joy_1[11:8], joy_1[1], joy_1[2], joy_1[0], joy_1[3], joy_1[7:6], (status[30:29] == 2'b01) ? joyrept_1[1:0] : joy_1[5:4]};
 		2: joy_data = ~{4'hF, joy_2[11:8], joy_2[1], joy_2[2], joy_2[0], joy_2[3], joy_2[7:6], (status[30:29] == 2'b01) ? joyrept_2[1:0] : joy_2[5:4]};
@@ -911,13 +1057,66 @@ reg [1:0] joyrept_3;
 reg [1:0] joyrept_4;
 reg [1:0] mouse_cnt;
 reg [7:0] ms_x, ms_y;
+reg [1:0] last_gp;			// promoted from input_block locals: savestate TOP_EXT
+reg       high_buttons = 0;
+
+// TOP_EXT eReg (slot 47): input-block state over the exported bus.
+// Layout (pce_savestates_pkg): high_buttons(0), joy_port(3:1), joy_latch(7:4),
+// scan_counter(11:8), joyrept_0..4(21:12), last_gp(23:22).
+// Save-only diagnostics, not restored:
+//   [47:40] dbg_save_cnt   ss_save pulses seen at the top level
+//   [55:48] dbg_load_cnt   ss_load pulses
+//   [57:56] dbg_last_slot  ss_slot at the last ss_save/ss_load pulse
+//   [59:58] ss_slot        live at blob-walk time (= savestate_ui ss_base)
+//   [61:60] status[46:45]  live OSD slot bits from the HPS
+//   [32:24] SS_DBG         forced flag + boundary-block terms at the last
+//                          failed check: {forced, !state0, res_int, cpu_ce,
+//                          !vbl, busy0, busy1, ext_hold, cd_hold}
+reg [7:0] dbg_save_cnt = 0, dbg_load_cnt = 0;
+reg [1:0] dbg_last_slot = 0;
+always @(posedge clk_sys) begin
+	if (ss_save) begin dbg_save_cnt <= dbg_save_cnt + 1'd1; dbg_last_slot <= ss_slot; end
+	if (ss_load) begin dbg_load_cnt <= dbg_load_cnt + 1'd1; dbg_last_slot <= ss_slot; end
+end
+
+wire [63:0] ss_top_ext_back = {2'd0, status[46:45], ss_slot, dbg_last_slot,
+                               dbg_load_cnt, dbg_save_cnt,
+                               7'd0, ss_dbg,
+                               last_gp, joyrept_4, joyrept_3, joyrept_2,
+                               joyrept_1, joyrept_0, scan_counter, joy_latch,
+                               joy_port, high_buttons};
+
+eReg_SavestateV #(.Adr(47), .def(64'h0)) iREG_SS_TOP_EXT
+(
+	.clk      (clk_sys),
+	.BUS_Din  (sse_din),
+	.BUS_Adr  (sse_adr),
+	.BUS_wren (sse_wren),
+	.BUS_rst  (sse_rst),
+	.BUS_Dout (sse_dout_ext),
+	.Din      (ss_top_ext_back),
+	.Dout     (ss_top_ext)
+);
 
 always @(posedge clk_sys) begin : input_block
-	reg  [1:0] last_gp;
-	reg        high_buttons = 0;
 	reg [14:0] mouse_to;
 	reg        ms_stb;
 	reg  [7:0] msr_x, msr_y;
+
+	if (sse_load) begin
+		// Restore the input scanner state.
+		high_buttons <= ss_top_ext[0];
+		joy_port     <= ss_top_ext[3:1];
+		joy_latch    <= ss_top_ext[7:4];
+		scan_counter <= ss_top_ext[11:8];
+		joyrept_0    <= ss_top_ext[13:12];
+		joyrept_1    <= ss_top_ext[15:14];
+		joyrept_2    <= ss_top_ext[17:16];
+		joyrept_3    <= ss_top_ext[19:18];
+		joyrept_4    <= ss_top_ext[21:20];
+		last_gp      <= ss_top_ext[23:22];
+	end
+	else if (~ss_sleep) begin	// Freeze input scanning during the walk.
 
 	if (reset)
 		high_buttons <= 0;
@@ -976,6 +1175,8 @@ always @(posedge clk_sys) begin : input_block
 	else if (joy_out[0] && ~last_gp[0] && (status[2] | status[27]) && (status[27:26] != 2'b11)) begin	// suppress if XE-1AP
 		joy_port <= joy_port + 3'd1;
 	end
+
+	end	// ~ss_sleep
 end
 
 wire snac = status[13];
@@ -1047,6 +1248,16 @@ wire        mb128_dirty;
 wire        mb128_ena = status[21];
 wire        mb128_Active;
 wire  [3:0] mb128_Data;
+wire        mb128_Idle;
+
+// MB128 RAM/protocol state is not captured. Enabling it blocks savestates
+// immediately; the latch persists until a new cart/core session, even if the
+// option is disabled again. Keep dirty as a defensive backstop.
+reg mb128_ss_blocked = 0;
+always @(posedge clk_sys) begin
+	if (cart_download) mb128_ss_blocked <= 0;
+	else if (mb128_ena | mb128_dirty) mb128_ss_blocked <= 1;
+end
 
 MB128 MB128
 (
@@ -1058,6 +1269,7 @@ MB128 MB128
 
    .o_Active(mb128_Active),	// high if MB128 asserts itself instead of joypad inputs
 	.o_Data(mb128_Data),
+	.o_Idle(mb128_Idle),
 
 	.bk_clk(clk_sys),
 	.bk_address({sd_lba[7:0] - 3'd4,sd_buff_addr}),
@@ -1070,7 +1282,12 @@ MB128 MB128
 reg bk_pending;
 
 always @(posedge clk_sys) begin
-	if (bk_ena && ~OSD_STATUS && (bram_wr || mb128_dirty))
+	// ~ss_sleep: a LOAD rewrites the backup RAM through the CPU's own BRM port,
+	// so without this the restore looks like the game saving and the next
+	// autosave writes the ROLLED-BACK contents over the player's .sav.  The
+	// upstream cores do not have this edge (NES_MiSTer marks the file dirty from
+	// the cart's own write strobe, not from its savestate walk).
+	if (bk_ena && ~OSD_STATUS && ((bram_wr && ~ss_sleep) || mb128_dirty))
 		bk_pending <= 1'b1;
 	else if (bk_state)
 		bk_pending <= 1'b0;
