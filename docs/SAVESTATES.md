@@ -189,7 +189,7 @@ Generated build-date text can affect the binary; bit-identical builds are not
 promised. Preserve source licenses and attributions when redistributing the
 core or Main. BIOS and game images are not included.
 
-The companion Main is branch `pcecd-sd-savestates` of
+The companion Main is tag `tg16-savestates-v0.2.0-pre1` of
 https://github.com/Bruc3Dev573/Main_MiSTer: MiSTer Main commit
 `f6a3caa601c22fe1c34647b48ecbff6b9c7ddc09` plus three commits, all in
 `support/pcecd/pcecd.cpp`. While the core is frozen it sets bit 8 of the CD_GET
