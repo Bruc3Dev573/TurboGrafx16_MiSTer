@@ -97,65 +97,14 @@ architecture rtl of cd is
 	signal SCSI_MSG_N			: std_logic;
 	signal SCSI_CD_N			: std_logic;
 	signal SCSI_IO_N			: std_logic;
-	signal SCSI_COMM_SEND_i	: std_logic;	-- internal tap: Quartus 17 cannot read out ports
 	signal CD_STOP_CD_SND	: std_logic;
 	signal SCSI_REPLAY_RESET : std_logic;
 
-	-- Save-only eReg 68: CD event times, in seconds since reset/load.
-	signal DBG_SECDIV  : unsigned(25 downto 0) := (others => '0');
-	signal DBG_SEC     : unsigned(15 downto 0) := (others => '0');
-	signal DBG_T_STAT  : unsigned(7 downto 0) := (others => '0');
-	signal DBG_T_COMM  : unsigned(7 downto 0) := (others => '0');
-	signal DBG_T_CDDA  : unsigned(7 downto 0) := (others => '0');
-	signal DBG_T_LOAD  : unsigned(7 downto 0) := (others => '0');
-	signal DBG_RSTCNT  : unsigned(7 downto 0) := (others => '0');
-	signal DBG_STATCNT : unsigned(7 downto 0) := (others => '0');
-	signal DBG_SG_D    : std_logic := '0';
-	signal DBG_CS_D    : std_logic := '0';
-	signal DBG_RN_D    : std_logic := '1';
-	signal DBG_QRY_CNT  : std_logic_vector(7 downto 0);	-- 7:4 = \$DE, 3:0 = \$DD
-	signal DBG_QRY_LAST : std_logic_vector(7 downto 0);
-	signal DBG_CMD_LEDGER : std_logic_vector(63 downto 0);
-	-- HPS command and transfer-end edge counts.
-	signal DBG_N_DEND  : unsigned(15 downto 0) := (others => '0');
-	signal DBG_N_CSEND : unsigned(15 downto 0) := (others => '0');
-	signal DBG_DEND_D  : std_logic := '0';
-	signal DBG_CSND_D  : std_logic := '0';
-	signal CD_DATA_END_i : std_logic;
-	signal SS_V_Dout_DBG68 : std_logic_vector(63 downto 0);
-	signal SS_V_Dout_DBG69 : std_logic_vector(63 downto 0);
-	signal SS_V_Dout_DBG70 : std_logic_vector(63 downto 0);
-	-- Save-only tail trace of the first READ6 after a load. Bank-zero reads
-	-- identify BIOS call sites, not an instruction PC (operands count too).
-	type TailTrace_t is array (0 to 7) of std_logic_vector(63 downto 0);
-	signal TAIL_TRACE, SS_Dout_TAIL : TailTrace_t := (others => (others => '0'));
-	signal TAIL_WAIT, TAIL_ARM : std_logic := '0';
-	signal TAIL_CLOCK : unsigned(31 downto 0) := (others => '0');
-	signal TAIL_ROM : std_logic_vector(15 downto 0) := (others => '1');
-	signal TAIL_RD_D, TAIL_WR_D, TAIL_BSY_D : std_logic := '1';
-	signal SCSI_COMM_i : std_logic_vector(95 downto 0);
 	
 	signal CD_DTD				: std_logic;	--CD data transfer done flag
 	signal CD_DTR				: std_logic;	--CD data transfer ready flag
 	signal CD_SUBCD			: std_logic;	--CD Subcode data ready flag
 	signal CD_DTD_EN			: std_logic;
-	-- Save-only CPU access counts for the CD register block.
-	signal DBG_CPURD  : unsigned(15 downto 0) := (others => '0');	-- reads of the CD register block
-	signal DBG_CPUWR  : unsigned(15 downto 0) := (others => '0');	-- writes to it
-	signal DBG_LASTRD : std_logic_vector(7 downto 0) := (others => '0');	-- last register read
-	signal DBG_LASTWR : std_logic_vector(7 downto 0) := (others => '0');	-- last register written
-	signal DBG_RD_D   : std_logic := '1';
-	-- Saturating per-register read counters.
-	type RegHits_t is array (0 to 15) of unsigned(3 downto 0);
-	signal DBG_RDHITS : RegHits_t := (others => (others => '0'));
-	-- Rising-edge counters for CPU-visible CD and ADPCM flags.
-	signal DBG_N_DTR   : unsigned(15 downto 0) := (others => '0');
-	signal DBG_N_DTD   : unsigned(15 downto 0) := (others => '0');
-	signal DBG_N_SUBCD : unsigned(15 downto 0) := (others => '0');
-	signal DBG_N_AEND  : unsigned(15 downto 0) := (others => '0');
-	signal DBG_F_D     : std_logic_vector(3 downto 0) := (others => '0');
-	signal SS_V_Dout_DBG71 : std_logic_vector(63 downto 0);
-	signal DBG_WR_D   : std_logic := '1';
 	signal CD_DTR_EN			: std_logic;
 --	signal CD_MOTOR			: std_logic;
 	signal CD_SUBCD_EN		: std_logic;
@@ -795,8 +744,8 @@ begin
 		MESSAGE		=> CD_MSG,
 		STAT_GET		=> CD_STAT_GET,
 		
-		COMMAND		=> SCSI_COMM_i,
-		COMM_SEND	=> SCSI_COMM_SEND_i,
+		COMMAND		=> CD_COMM,
+		COMM_SEND	=> CD_COMM_SEND,
 		
 		DOUT_REQ		=> CD_DOUT_REQ,
 		DOUT			=> CD_DOUT,
@@ -807,7 +756,7 @@ begin
 		
 		CD_DATA		=> CD_DATA,
 		CD_WR			=> CD_DATA_WR,
-		CD_DATA_END	=> CD_DATA_END_i,
+		CD_DATA_END	=> CD_DATA_END,
 		DATAIN_HELD	=> SCSI_DATAIN_HELD,
 
 		SLEEP				=> SLEEP,
@@ -827,235 +776,8 @@ begin
 		REPLAY_CONSUMED => REPLAY_CONSUMED,
 		REPLAY_FAST => CD_FAST_SEEK,
 		REPLAY_AUDIO => REPLAY_AUDIO,
-		REPLAY_RESUME => REPLAY_RESUME,
-		DBG_QRY_CNT		=> DBG_QRY_CNT,
-		DBG_QRY_LAST	=> DBG_QRY_LAST,
-		DBG_CMD_LEDGER	=> DBG_CMD_LEDGER
+		REPLAY_RESUME => REPLAY_RESUME
 	);
-
-	CD_COMM_SEND <= SCSI_COMM_SEND_i;
-	CD_COMM <= SCSI_COMM_i;
-	CD_DATA_END  <= CD_DATA_END_i;
-
-	-- eRegs 76..83: oldest to newest. Each record contains elapsed clocks/256
-	-- (63:40), last bank-zero read address (39:24), event (23:16), value
-	-- (15:8), and BSY_N/REQ_N/MSG_N/CD_N/IO_N/ACK_N/DTD_EN/DTR_EN (7:0).
-	-- Events: 1=$1801 read in STATUS/MSGIN, 2=$1802 ACK-changing write,
-	-- 3=bus release, 4=READ6 arm. Freeze on bus release; never restore.
-	process(CLK)
-		variable event, value, lines : std_logic_vector(7 downto 0);
-	begin
-		if rising_edge(CLK) then
-			if RST_N = '0' or SaveStateBus_load = '1' then
-				TAIL_TRACE <= (others => (others => '0'));
-				TAIL_WAIT <= SaveStateBus_load;
-				TAIL_ARM <= '0';
-				TAIL_CLOCK <= (others => '0');
-				TAIL_ROM <= (others => '1');
-				TAIL_RD_D <= '1'; TAIL_WR_D <= '1'; TAIL_BSY_D <= '1';
-			else
-				TAIL_RD_D <= EXT_RD_N;
-				TAIL_WR_D <= EXT_WR_N;
-				TAIL_BSY_D <= SCSI_BSY_N;
-				if EN = '1' and SLEEP = '0' and CPU_CE = '1'
-				   and EXT_RD_N = '0' and EXT_A(20 downto 13) = x"00" then
-					TAIL_ROM <= "000" & EXT_A(12 downto 0);
-				end if;
-				event := x"00"; value := x"00";
-				lines := SCSI_BSY_N & SCSI_REQ_N & SCSI_MSG_N & SCSI_CD_N
-				         & SCSI_IO_N & SCSI_ACK_N & CD_DTD_EN & CD_DTR_EN;
-				if TAIL_WAIT = '1' and SCSI_COMM_SEND_i = '1'
-				   and SCSI_COMM_i(7 downto 0) = x"08" then
-					TAIL_WAIT <= '0'; TAIL_ARM <= '1';
-					TAIL_CLOCK <= (others => '0');
-					event := x"04"; value := SCSI_COMM_i(39 downto 32);
-				elsif TAIL_ARM = '1' then
-					if TAIL_CLOCK /= x"FFFFFFFF" then TAIL_CLOCK <= TAIL_CLOCK + 1; end if;
-					if SCSI_BSY_N = '1' and TAIL_BSY_D = '0' then
-						event := x"03";
-						TAIL_ARM <= '0';
-					elsif EN = '1' and SLEEP = '0' and REG_SEL = '1' then
-						if EXT_RD_N = '0' and TAIL_RD_D = '1' and EXT_A(7 downto 0) = x"01"
-						   and SCSI_CD_N = '0' and SCSI_IO_N = '0' then
-							event := x"01"; value := SCSI_DBO;
-						elsif EXT_WR_N = '0' and TAIL_WR_D = '1' and EXT_A(7 downto 0) = x"02"
-						   and EXT_DI(7) = SCSI_ACK_N then
-							event := x"02"; value := EXT_DI;
-						end if;
-					end if;
-				end if;
-				if event /= x"00" then
-					for i in 0 to 6 loop TAIL_TRACE(i) <= TAIL_TRACE(i+1); end loop;
-					TAIL_TRACE(7) <= std_logic_vector(TAIL_CLOCK(31 downto 8))
-					                 & TAIL_ROM & event & value & lines;
-				end if;
-			end if;
-		end if;
-	end process;
-
-	GEN_TAIL_TRACE : for i in 0 to 7 generate
-		iSS_TAIL : entity work.eReg_SavestateV
-		generic map ( Adr => 76+i, def => SSREG_DEFAULT_CD )
-		port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-		           SaveStateBus_rst, SS_Dout_TAIL(i), TAIL_TRACE(i), open );
-	end generate;
-
-	process( CLK ) begin
-		if rising_edge(CLK) then
-			if RST_N = '0' then
-				DBG_N_DEND <= (others => '0'); DBG_N_CSEND <= (others => '0');
-			else
-				DBG_DEND_D <= CD_DATA_END_i;
-				if CD_DATA_END_i = '1' and DBG_DEND_D = '0' then
-					DBG_N_DEND <= DBG_N_DEND + 1;
-				end if;
-				DBG_CSND_D <= SCSI_COMM_SEND_i;
-				if SCSI_COMM_SEND_i = '1' and DBG_CSND_D = '0' then
-					DBG_N_CSEND <= DBG_N_CSEND + 1;
-				end if;
-			end if;
-		end if;
-	end process;
-
-	-- Save-only eReg 68: CD interface event times at one-second resolution.
-	process( CLK )
-	begin
-		if rising_edge(CLK) then
-			if RST_N = '0' then
-				DBG_SECDIV <= (others => '0'); DBG_SEC <= (others => '0');
-				DBG_T_STAT <= (others => '0'); DBG_T_COMM <= (others => '0');
-				DBG_T_CDDA <= (others => '0'); DBG_T_LOAD <= (others => '0');
-				DBG_RSTCNT <= (others => '0'); DBG_STATCNT <= (others => '0');
-			else
-				DBG_SECDIV <= DBG_SECDIV + 1;
-				if DBG_SECDIV = 42954544 then
-					DBG_SECDIV <= (others => '0');
-					if DBG_SEC /= x"FFFF" then
-						DBG_SEC <= DBG_SEC + 1;
-					end if;
-				end if;
-				DBG_SG_D <= CD_STAT_GET;
-				if CD_STAT_GET = '1' and DBG_SG_D = '0' then
-					DBG_T_STAT <= DBG_SEC(7 downto 0);
-					if DBG_STATCNT /= x"FF" then
-						DBG_STATCNT <= DBG_STATCNT + 1;
-					end if;
-				end if;
-				DBG_CS_D <= SCSI_COMM_SEND_i;
-				if SCSI_COMM_SEND_i = '1' and DBG_CS_D = '0' then
-					DBG_T_COMM <= DBG_SEC(7 downto 0);
-				end if;
-				DBG_RN_D <= SCSI_RST_N;
-				if SCSI_RST_N = '0' and DBG_RN_D = '1' then
-					if DBG_RSTCNT /= x"FF" then
-						DBG_RSTCNT <= DBG_RSTCNT + 1;
-					end if;
-				end if;
-				if CD_AUDIO_WR = '1' then
-					DBG_T_CDDA <= DBG_SEC(7 downto 0);
-				end if;
-				if SaveStateBus_load = '1' then
-					DBG_T_LOAD <= DBG_SEC(7 downto 0);
-				end if;
-			end if;
-		end if;
-	end process;
-
-	iSS_CD_DBG68 : entity work.eReg_SavestateV
-	generic map ( Adr => 68, def => SSREG_DEFAULT_CD )
-	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-	           SaveStateBus_rst, SS_V_Dout_DBG68,
-	           std_logic_vector(DBG_STATCNT) & std_logic_vector(DBG_RSTCNT)
-	         & std_logic_vector(DBG_T_LOAD) & std_logic_vector(DBG_T_CDDA)
-	         & std_logic_vector(DBG_T_COMM) & std_logic_vector(DBG_T_STAT)
-	         & std_logic_vector(DBG_SEC), open );
-
-	-- eReg 69: CPU register accesses counted on edges, since reset/load.
-	--   15:0  reads of $1800..$18FF      39:32 last register read
-	--   31:16 writes to it               47:40 last register written
-	--   55:48 query commands issued     63:56 last query opcode
-	-- Query counts survive load and describe the current title's commands.
-	process( CLK )
-	begin
-		if rising_edge(CLK) then
-			if RST_N = '0' then
-				DBG_CPURD <= (others => '0'); DBG_CPUWR <= (others => '0');
-				DBG_LASTRD <= (others => '0'); DBG_LASTWR <= (others => '0');
-				DBG_RD_D <= '1'; DBG_WR_D <= '1';
-				DBG_RDHITS <= (others => (others => '0'));
-			else
-				DBG_RD_D <= EXT_RD_N;
-				if REG_SEL = '1' and EXT_RD_N = '0' and DBG_RD_D = '1' then
-					DBG_LASTRD <= EXT_A(7 downto 0);
-					if DBG_CPURD /= x"FFFF" then
-						DBG_CPURD <= DBG_CPURD + 1;
-					end if;
-					if DBG_RDHITS(to_integer(unsigned(EXT_A(3 downto 0)))) /= x"F" then
-						DBG_RDHITS(to_integer(unsigned(EXT_A(3 downto 0))))
-							<= DBG_RDHITS(to_integer(unsigned(EXT_A(3 downto 0)))) + 1;
-					end if;
-				end if;
-				DBG_WR_D <= EXT_WR_N;
-				if REG_SEL = '1' and EXT_WR_N = '0' and DBG_WR_D = '1' then
-					DBG_LASTWR <= EXT_A(7 downto 0);
-					if DBG_CPUWR /= x"FFFF" then
-						DBG_CPUWR <= DBG_CPUWR + 1;
-					end if;
-				end if;
-			end if;
-		end if;
-	end process;
-
-	iSS_CD_DBG69 : entity work.eReg_SavestateV
-	generic map ( Adr => 69, def => SSREG_DEFAULT_CD )
-	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-	           SaveStateBus_rst, SS_V_Dout_DBG69,
-	           DBG_QRY_LAST & DBG_QRY_CNT & DBG_LASTWR & DBG_LASTRD
-	         & std_logic_vector(DBG_CPUWR) & std_logic_vector(DBG_CPURD), open );
-
-	-- eReg 70: replay diagnostics from SCSI.
-	-- 11:0 READ_SKIP, 12 EMPTY, 13 RSKIP_GAP, 14 SLEEP, 15 RP_FREEZE,
-	-- 17:16 SWALLOW, 41:18 RSKIP_STARVE, 45:42 replay state,
-	-- 46 TAILDRAIN, 47 READ_ACTIVE, 63:48 FIFO byte count.
-	iSS_CD_DBG70 : entity work.eReg_SavestateV
-	generic map ( Adr => 70, def => SSREG_DEFAULT_CD )
-	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-	           SaveStateBus_rst, SS_V_Dout_DBG70, DBG_CMD_LEDGER, open );
-
-	-- eReg 71: rises of the four flags the program polls, since the load.
-	process( CLK )
-	begin
-		if rising_edge(CLK) then
-			if RST_N = '0' then
-				DBG_N_DTR <= (others => '0'); DBG_N_DTD <= (others => '0');
-				DBG_N_SUBCD <= (others => '0'); DBG_N_AEND <= (others => '0');
-				DBG_F_D <= (others => '0');
-			else
-				DBG_F_D <= CD_DTR & CD_DTD & CD_SUBCD & ADPCM_END;
-				if CD_DTR = '1' and DBG_F_D(3) = '0' and DBG_N_DTR /= x"FFFF" then
-					DBG_N_DTR <= DBG_N_DTR + 1;
-				end if;
-				if CD_DTD = '1' and DBG_F_D(2) = '0' and DBG_N_DTD /= x"FFFF" then
-					DBG_N_DTD <= DBG_N_DTD + 1;
-				end if;
-				if CD_SUBCD = '1' and DBG_F_D(1) = '0' and DBG_N_SUBCD /= x"FFFF" then
-					DBG_N_SUBCD <= DBG_N_SUBCD + 1;
-				end if;
-				if ADPCM_END = '1' and DBG_F_D(0) = '0' and DBG_N_AEND /= x"FFFF" then
-					DBG_N_AEND <= DBG_N_AEND + 1;
-				end if;
-			end if;
-		end if;
-	end process;
-
-	iSS_CD_DBG71 : entity work.eReg_SavestateV
-	generic map ( Adr => 71, def => SSREG_DEFAULT_CD )
-	port map ( CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-	           SaveStateBus_rst, SS_V_Dout_DBG71,
-	           std_logic_vector(DBG_N_CSEND) & std_logic_vector(DBG_N_DEND)
-	         & std_logic_vector(DBG_N_DTD) & std_logic_vector(DBG_N_DTR), open );
-	-- Bits 63:48 count CD_COMM_SEND; 47:32 count CD_DATA_END.
-
 
 	--ADPCM DRAM
 	process( RST_N, CLK )
@@ -1643,9 +1365,6 @@ begin
 
 	SaveStateBus_Dout <= SS_V_Dout(0) or SS_V_Dout(1) or SS_V_Dout(2)
 	                  or SS_V_Dout(3) or SS_V_Dout(4) or SS_V_Dout(5)
-	                  or SS_V_Dout_DBG68 or SS_V_Dout_DBG69 or SS_V_Dout_DBG70 or SS_V_Dout_DBG71
-	                  or SS_Dout_TAIL(0) or SS_Dout_TAIL(1) or SS_Dout_TAIL(2) or SS_Dout_TAIL(3)
-	                  or SS_Dout_TAIL(4) or SS_Dout_TAIL(5) or SS_Dout_TAIL(6) or SS_Dout_TAIL(7)
 	                  or SS_Dout_SCSI;
 
 	-- The boundary waits for a quiet SCSI, no pending ADPCM DMA write and the

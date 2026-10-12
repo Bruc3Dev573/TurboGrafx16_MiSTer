@@ -49,8 +49,7 @@ architecture sim of tb_arcade_memory is
 	signal ram_data, ram_q : std_logic_vector(7 downto 0) := (others => '0');
 	signal ram_rd, ram_wr, kick, active : std_logic;
 	signal ram_ready : std_logic := '1';
-	signal dbg_ns : unsigned(15 downto 0);
-	signal dbg_to, dbg_max : unsigned(7 downto 0);
+	signal saw_slow_byte : boolean := false;
 	signal ddr_adr : std_logic_vector(25 downto 0);
 	signal ddr_din, ddr_dout : std_logic_vector(63 downto 0) := (others => '0');
 	signal ddr_be : std_logic_vector(7 downto 0);
@@ -87,12 +86,12 @@ begin
 		region => region, walk_addr => addr, walk_wr => wr, walk_data => data,
 		walk_q => ext_q, walk_ready => ready, active => active,
 		ram_addr => ram_addr, ram_data => ram_data, ram_q => ram_q,
-		ram_ready => ram_ready, ram_rd => ram_rd, ram_wr => ram_wr, kick => kick,
-		debug_no_dip => dbg_ns, debug_timeout => dbg_to, debug_max => dbg_max
+		ram_ready => ram_ready, ram_rd => ram_rd, ram_wr => ram_wr, kick => kick
 	);
 
 	process(clk)
 		variable freeze_delay : natural := 0;
+		variable byte_cycles : natural := 0;
 	begin
 		if rising_edge(clk) then
 			cycles <= cycles + 1;
@@ -106,6 +105,13 @@ begin
 			end if;
 			assert active /= '1' or (sleeping = '1' and frozen = '1')
 				report "port borrowed before freeze/after walk" severity failure;
+			if region = 10 and (ram_rd = '1' or ram_wr = '1') then
+				byte_cycles := byte_cycles + 1;
+				assert byte_cycles < 256 report "external byte reached timeout" severity failure;
+			else
+				if byte_cycles > 22 then saw_slow_byte <= true; end if;
+				byte_cycles := 0;
+			end if;
 		end if;
 	end process;
 
@@ -321,7 +327,7 @@ begin
 				report "incomplete/incorrect load" severity failure;
 			assert ddr_reads - reads_before = expected_dwords / 2 and ddr_writes = writes_before
 				report "load word count/slot changed" severity failure;
-			assert dbg_to = 0 and dbg_max > 21 report "latency coverage/timeout" severity failure;
+			assert saw_slow_byte report "latency coverage" severity failure;
 			check_memory <= '1'; check_blob <= '1'; tick;
 			assert memory_checked = '1' and blob_checked = '1' severity failure;
 			check_memory <= '0'; check_blob <= '0'; tick;

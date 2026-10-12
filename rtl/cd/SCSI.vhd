@@ -41,11 +41,6 @@ entity SCSI is
 		STOP_CD_SND	: out std_logic;
 		
 		DBG_DATAIN_CNT: out unsigned(15 downto 0);
-		-- Saturating counters for CD_DINFO ($DE) and READ SUBQ ($DD).
-		DBG_QRY_CNT   : out std_logic_vector(7 downto 0);	-- 7:4 = $DE, 3:0 = $DD
-		DBG_QRY_LAST  : out std_logic_vector(7 downto 0);
-		-- Replay state, FIFO activity and pending drain/status counts.
-		DBG_CMD_LEDGER: out std_logic_vector(63 downto 0);
 
 		-- '1' while the CPU-facing FSM is held with a DATAIN byte staged:
 		-- cd.vhd must not advertise "data ready" meanwhile
@@ -158,31 +153,12 @@ architecture rtl of SCSI is
 	signal READ_ACTIVE   : std_logic;
 	-- a query command ($DD READ SUBQ, $DE CD_DINFO, ...) is outstanding
 	signal QRY_ACTIVE    : std_logic;
-	signal CNT_QRY       : unsigned(7 downto 0) := (others => '0');	-- saturates at 255
-	-- Separate counters distinguish disc-info and subchannel queries.
-	signal CNT_DE        : unsigned(3 downto 0) := (others => '0');	-- $DE CD_DINFO
-	signal CNT_DD        : unsigned(3 downto 0) := (others => '0');	-- $DD READ SUBQ
-	signal LAST_QRY      : std_logic_vector(7 downto 0) := (others => '0');
-	signal CNT_CMD_G     : unsigned(7 downto 0) := (others => '0');	-- game commands
-	signal CNT_CMD_R     : unsigned(7 downto 0) := (others => '0');	-- replay commands
-	signal LAST_CMD_G    : std_logic_vector(7 downto 0) := (others => '0');
-	signal LAST_CMD_R    : std_logic_vector(7 downto 0) := (others => '0');
-	signal CNT_OVERLAP   : unsigned(7 downto 0) := (others => '0');	-- sends while a command is pending
-	signal LOST_CMD      : std_logic_vector(7 downto 0) := (others => '0');	-- last opcode from the other sender
-	signal CNT_STATG     : unsigned(7 downto 0) := (others => '0');	-- received statuses
-	signal CMD_OPEN      : std_logic := '0';	-- a command is awaiting status
-	signal DBG_CO_D      : std_logic := '0';
-	signal DBG_RS_D      : std_logic := '0';
-	signal RP_ENC        : std_logic_vector(3 downto 0);
 	-- The HPS mailbox holds one command; wait for status before reusing it.
 	signal CMD_OUTST     : std_logic := '0';
 	signal CMD_SEND_D    : std_logic := '0';
-	signal RD6_CMD       : std_logic_vector(47 downto 0) := (others => '0');	-- last READ6 sent by the game
 	signal READ_CONSUMED : unsigned(20 downto 0);	-- bytes handed to the CPU since the 08 accept
 	signal READ_SKIP     : unsigned(11 downto 0);	-- replayed-stream bytes still to drain
 	signal SWALLOW       : unsigned(1 downto 0);	-- pending replay statuses to discard
-	-- Diagnostic only: elapsed empty-FIFO cycles wrap modulo 2^24.
-	signal RSKIP_STARVE  : unsigned(23 downto 0);
 	signal RSKIP_GAP     : std_logic := '0';	-- idle cycle after a drain pop (EMPTY is registered)
 	signal SWAL_AGE      : unsigned(27 downto 0);	-- wait time for pending replay statuses
 	signal SEL_FLUSH     : std_logic := '0';	-- 1-CLK FIFO flush: game SEL while a replay drain was still pending
@@ -261,39 +237,6 @@ architecture rtl of SCSI is
 	signal SS_V_BACK : slv64_array6 := (others => (others => '0'));
 	signal SS_V_Dout : slv64_array6;
 	signal SP_ENC    : std_logic_vector(3 downto 0);
-
-	-- Diagnostic eRegs 65/66 are saved but never restored.
-	signal SP_HIST        : std_logic_vector(31 downto 0) := (others => '0');
-	signal SP_ENC_D2      : std_logic_vector(3 downto 0) := (others => '0');
-	signal CNT_STATGET    : unsigned(7 downto 0) := (others => '0');
-	signal CNT_SEL        : unsigned(7 downto 0) := (others => '0');
-	signal CNT_MSGIN      : unsigned(7 downto 0) := (others => '0');
-	signal CNT_STATPEND   : unsigned(7 downto 0) := (others => '0');
-	signal DBG_STATGET_D  : std_logic := '0';
-	signal DBG_SEL_D      : std_logic := '1';
-	signal DBG_STATPEND_D : std_logic := '0';
-	signal SS_V_Dout_DBG  : std_logic_vector(63 downto 0);
-	signal CNT_REQ        : unsigned(15 downto 0) := (others => '0');
-	signal CNT_ACK        : unsigned(15 downto 0) := (others => '0');
-	signal CNT_FIFOWR     : unsigned(15 downto 0) := (others => '0');
-	signal CNT_COMMSEND   : unsigned(7 downto 0) := (others => '0');
-	signal CNT_RPISSUE    : unsigned(3 downto 0) := (others => '0');
-	signal LAST_ACK_SP    : std_logic_vector(3 downto 0) := (others => '0');
-	signal LAST_REQ_SP    : std_logic_vector(3 downto 0) := (others => '0');
-	signal DBG_REQ_D      : std_logic := '1';
-	signal DBG_ACK_D      : std_logic := '1';
-	signal DBG_DE_D       : std_logic := '0';
-	signal DBG_CS_D       : std_logic := '0';
-	signal SS_V_Dout_DBG2 : std_logic_vector(63 downto 0);
-
-	-- Save-only audio-stop diagnostics.
-	-- Event byte: 7:6 = status/game/replay/marker, 5:0 = status or opcode.
-	-- C0 marks a load; C1 precedes events sampled on the same clock.
-	signal AUD_EVENTS    : std_logic_vector(63 downto 0) := (others => '0');
-	signal AUD_STOP_EVENTS : std_logic_vector(63 downto 0) := (others => '0');
-	signal AUD_STOP_INFO : std_logic_vector(63 downto 0) := (others => '0');
-	signal AUD_ACTIVE_D  : std_logic := '0';
-	signal SS_V_Dout_AUD_STOP, SS_V_Dout_AUD_EVENTS : std_logic_vector(63 downto 0);
 
 	function sp_encode(x : SCSIPhase_t) return std_logic_vector is
 	begin
@@ -381,7 +324,6 @@ begin
 			READ_CONSUMED <= (others => '0');
 			READ_SKIP <= (others => '0');
 			SWALLOW <= (others => '0');
-			RSKIP_STARVE <= (others => '0');
 			RSKIP_GAP <= '0';
 			SWAL_AGE <= (others => '0');
 			AUD_OPEN <= '0';
@@ -468,7 +410,6 @@ begin
 				-- never captured non-zero (the quiet gate forbids it): just clear
 				READ_SKIP <= (others => '0');
 				SWALLOW   <= (others => '0');
-				RSKIP_STARVE <= (others => '0');
 				RSKIP_GAP <= '0';
 				SWAL_AGE  <= (others => '0');
 				AUDIO_B2     <= SS_V(1)(39 downto 32);
@@ -566,14 +507,11 @@ begin
 						FIFO_RD_REQ <= '1';
 						READ_SKIP <= READ_SKIP - 1;
 						RSKIP_GAP <= '1';
-						RSKIP_STARVE <= (others => '0');
 						-- Tail drain: nothing in the re-read belongs to the CPU, so
 						-- flush on the last pop (the in-flight byte dies in the aclr).
 						if READ_SKIP = 1 and RP_TAILDRAIN = '1' then
 							TAIL_FLUSH <= '1';	-- RP_TAILDRAIN is cleared by its owner (replay process)
 						end if;
-					else
-						RSKIP_STARVE <= RSKIP_STARVE + 1;
 					end if;
 				elsif RP_FREEZE = '0' then
 				case SP is
@@ -591,7 +529,6 @@ begin
 								SEL_FLUSH <= '1';	-- drop the abandoned re-read's queued bytes
 							end if;
 							READ_SKIP    <= (others => '0');
-							RSKIP_STARVE <= (others => '0');
 							RSKIP_GAP    <= '0';
 							BSY_Nr <= '0';
 							MSG_Nr <= '1';
@@ -677,16 +614,6 @@ begin
 								if COMM(0) /= x"08" and COMM(0) /= x"D8"
 								   and COMM(0) /= x"D9" and COMM(0) /= x"DA" then
 									QRY_ACTIVE <= '1';
-									LAST_QRY   <= COMM(0);
-									if COMM(0) = x"DE" and CNT_DE /= x"F" then
-										CNT_DE <= CNT_DE + 1;
-									end if;
-									if COMM(0) = x"DD" and CNT_DD /= x"F" then
-										CNT_DD <= CNT_DD + 1;
-									end if;
-									if CNT_QRY /= x"FF" then
-										CNT_QRY <= CNT_QRY + 1;
-									end if;
 								end if;
 								if (COMM(0) = x"D8") then	-- SAPSP: latch the raw start point
 									AUDIO_ACTIVE <= '1';
@@ -915,7 +842,6 @@ begin
 			RP_RETRY_AGE <= (others => '0');
 			RP_RETRIED <= '0';
 			RP_AUD_DONE <= '0';
-			CNT_RPISSUE <= (others => '0');
 			RP_RETRY_RUN <= '0';
 			LF_ARM <= '0';
 			LF_REPLAY <= '0';
@@ -1241,9 +1167,6 @@ begin
 
 				when RP_ISSUE =>	-- re-issue the D8 at the resume position
 					RP_AUD_DONE <= '1';	-- allow one retry of this audio pair
-					if CNT_RPISSUE /= x"F" then	-- eReg 66 63:60, saturating
-						CNT_RPISSUE <= CNT_RPISSUE + 1;
-					end if;
 					RP_COMM <= (others => '0');
 					RP_COMM(7 downto 0) <= x"D8";
 					RP_COMM(9 downto 8) <= AUDIO_B1;	-- byte1: original CDDA play mode
@@ -1482,8 +1405,6 @@ begin
 	DOUT_SEND <= DATA_OUT;
 	
 	DBG_DATAIN_CNT <= DATAIN_CNT;
-	DBG_QRY_CNT    <= std_logic_vector(CNT_DE) & std_logic_vector(CNT_DD);
-	DBG_QRY_LAST   <= LAST_QRY;
 
 	-- Savestates (slot map: pce_savestates_pkg.vhd).
 	-- FIFO contents are not saved: READ6 replay reconstructs unread data.
@@ -1575,40 +1496,6 @@ begin
 		);
 	end generate;
 
-	-- eReg 65: phase history and event counters since reset.
-	--   31:0 last 8 SP phases (4-bit sp_encode each, newest in 3:0)
-	--   39:32 STAT_GET strobes, 47:40 game SELs, 55:48 MSGIN entries,
-	--   63:56 STAT_PEND rises - all saturating
-	process(CLK) begin
-		if rising_edge(CLK) then
-			if RESET_N = '0' then
-				SP_HIST <= (others => '0');
-				CNT_STATGET <= (others => '0'); CNT_SEL <= (others => '0');
-				CNT_MSGIN <= (others => '0'); CNT_STATPEND <= (others => '0');
-			else
-				SP_ENC_D2 <= SP_ENC;
-				if SP_ENC /= SP_ENC_D2 then
-					SP_HIST <= SP_HIST(27 downto 0) & SP_ENC;
-					if SP = SP_MSGIN_START and CNT_MSGIN /= x"FF" then
-						CNT_MSGIN <= CNT_MSGIN + 1;
-					end if;
-				end if;
-				DBG_STATGET_D <= STAT_GET;
-				if STAT_GET = '1' and DBG_STATGET_D = '0' and CNT_STATGET /= x"FF" then
-					CNT_STATGET <= CNT_STATGET + 1;
-				end if;
-				DBG_SEL_D <= SEL_N;
-				if SEL_N = '0' and DBG_SEL_D = '1' and CNT_SEL /= x"FF" then
-					CNT_SEL <= CNT_SEL + 1;
-				end if;
-				DBG_STATPEND_D <= STAT_PEND;
-				if STAT_PEND = '1' and DBG_STATPEND_D = '0' and CNT_STATPEND /= x"FF" then
-					CNT_STATPEND <= CNT_STATPEND + 1;
-				end if;
-			end if;
-		end if;
-	end process;
-
 	-- Track the command awaiting HPS status to serialize mailbox writes.
 	-- On load, restore any pending audio response from AUD_OPEN.
 	-- Drive reset clears physical work, not the game's saved response.
@@ -1632,205 +1519,8 @@ begin
 		end if;
 	end process;
 
-	-- Count game/replay sends and sends made before the previous status.
-	-- CMD_OPEN is diagnostic; CMD_OUTST controls replay serialization.
-	process(CLK) begin
-		if rising_edge(CLK) then
-			if RESET_N = '0' then
-				CNT_CMD_G <= (others => '0'); CNT_CMD_R <= (others => '0');
-				CNT_OVERLAP <= (others => '0'); CNT_STATG <= (others => '0');
-				LAST_CMD_G <= (others => '0'); LAST_CMD_R <= (others => '0');
-				LOST_CMD <= (others => '0'); CMD_OPEN <= '0';
-				RD6_CMD <= (others => '0');
-			else
-				DBG_CO_D <= COMM_OUT;
-				DBG_RS_D <= RP_SEND;
-				if COMM_OUT = '1' and DBG_CO_D = '0' then
-					LAST_CMD_G <= COMM(0);
-					-- Capture READ6 on send before later commands overwrite COMM.
-					if COMM(0) = x"08" then
-						RD6_CMD <= COMM(5) & COMM(4) & COMM(3) & COMM(2) & COMM(1) & COMM(0);
-					end if;
-					if CNT_CMD_G /= x"FF" then CNT_CMD_G <= CNT_CMD_G + 1; end if;
-					if CMD_OPEN = '1' then
-						if CNT_OVERLAP /= x"FF" then CNT_OVERLAP <= CNT_OVERLAP + 1; end if;
-						LOST_CMD <= LAST_CMD_R;
-					end if;
-					CMD_OPEN <= '1';
-				end if;
-				if RP_SEND = '1' and DBG_RS_D = '0' then
-					LAST_CMD_R <= RP_COMM(7 downto 0);
-					if CNT_CMD_R /= x"FF" then CNT_CMD_R <= CNT_CMD_R + 1; end if;
-					if CMD_OPEN = '1' then
-						if CNT_OVERLAP /= x"FF" then CNT_OVERLAP <= CNT_OVERLAP + 1; end if;
-						LOST_CMD <= LAST_CMD_G;	-- last game opcode at overlap
-					end if;
-					CMD_OPEN <= '1';
-				end if;
-				if STAT_GET = '1' and STAT_GET_D = '0' then
-					CMD_OPEN <= '0';
-					if CNT_STATG /= x"FF" then CNT_STATG <= CNT_STATG + 1; end if;
-				end if;
-				if CD_RESET_DONE = '1' and RP = RP_RESET_WAIT then
-					CMD_OPEN <= '0';
-				end if;
-			end if;
-		end if;
-	end process;
-
-	-- AUDIO_ACTIVE is the game's resumable-audio latch, not HPS PLAY state.
-	-- Capture its last falling edge outside reset/load, including the command
-	-- accepted on that edge. Later polling must not overwrite the snapshot.
-	process(CLK)
-		variable events : std_logic_vector(63 downto 0);
-		variable game_edge, replay_edge, status_edge : boolean;
-		variable game_count, replay_count, status_count : unsigned(7 downto 0);
-	begin
-		if rising_edge(CLK) then
-			if RESET_N = '0' then
-				AUD_EVENTS <= (others => '0');
-				AUD_STOP_EVENTS <= (others => '0');
-				AUD_STOP_INFO <= (others => '0');
-				AUD_ACTIVE_D <= '0';
-			elsif SaveStateBus_load = '1' then
-				AUD_EVENTS <= x"00000000000000C0";
-				AUD_STOP_EVENTS <= (others => '0');
-				AUD_STOP_INFO <= (others => '0');
-				AUD_ACTIVE_D <= SS_V(0)(58);
-			else
-				AUD_ACTIVE_D <= AUDIO_ACTIVE;
-				game_edge := COMM_OUT = '1' and DBG_CO_D = '0';
-				replay_edge := RP_SEND = '1' and DBG_RS_D = '0';
-				status_edge := STAT_GET = '1' and STAT_GET_D = '0';
-				events := AUD_EVENTS;
-				game_count := CNT_CMD_G;
-				replay_count := CNT_CMD_R;
-				status_count := CNT_STATG;
-				if (game_edge and replay_edge) or (game_edge and status_edge)
-				   or (replay_edge and status_edge) then
-					events := events(55 downto 0) & x"C1";
-				end if;
-				if status_edge then
-					events := events(55 downto 0) & "00" & STATUS(5 downto 0);
-					if status_count /= x"FF" then status_count := status_count + 1; end if;
-				end if;
-				if game_edge then
-					events := events(55 downto 0) & "01" & COMM(0)(5 downto 0);
-					if game_count /= x"FF" then game_count := game_count + 1; end if;
-				end if;
-				if replay_edge then
-					events := events(55 downto 0) & "10" & RP_COMM(5 downto 0);
-					if replay_count /= x"FF" then replay_count := replay_count + 1; end if;
-				end if;
-				AUD_EVENTS <= events;
-				if AUD_ACTIVE_D = '1' and AUDIO_ACTIVE = '0' then
-					AUD_STOP_EVENTS <= events;
-					AUD_STOP_INFO <= std_logic_vector(CDDA_CONSUMED) & COMM(0)
-					               & std_logic_vector(game_count) & std_logic_vector(replay_count)
-					               & std_logic_vector(status_count);
-				end if;
-			end if;
-		end if;
-	end process;
-
-	-- 74: 63:32 consumed samples, 31:24 stop opcode, 23:16 game commands,
-	--     15:8 replay commands, 7:0 statuses, all at the last audio-latch fall.
-	-- 75: last eight interface events at that fall, newest byte in 7:0.
-	iSS_AUD_STOP : entity work.eReg_SavestateV
-	generic map ( Adr => 74, def => SSREG_DEFAULT_CD )
-	port map (CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-	          SaveStateBus_rst, SS_V_Dout_AUD_STOP, AUD_STOP_INFO, open);
-	iSS_AUD_EVENTS : entity work.eReg_SavestateV
-	generic map ( Adr => 75, def => SSREG_DEFAULT_CD )
-	port map (CLK, SaveStateBus_Din, SaveStateBus_Adr, SaveStateBus_wren,
-	          SaveStateBus_rst, SS_V_Dout_AUD_EVENTS, AUD_STOP_EVENTS, open);
-
-	-- Replay state encoding for diagnostics. READ_SKIP holds the CPU-facing
-	-- SCSI FSM until all already-consumed bytes have been drained.
-	with RP select RP_ENC <=
-		x"0" when RP_IDLE,       x"1" when RP_WAIT,      x"2" when RP_CVT_START,
-		x"3" when RP_DIV588,     x"4" when RP_CVT_END,   x"5" when RP_LOOPMOD,
-		x"6" when RP_HOLDGAP,    x"7" when RP_ISSUE,     x"8" when RP_GAP,
-		x"9" when RP_ISSUE_D9,   x"A" when RP_LF_CALC,   x"B" when RP_RD_PREP,
-		x"C" when RP_RD_ISSUE,   x"D" when RP_PAUSE,     x"E" when RP_QRY_PREP,
-		x"F" when RP_QRY_ISSUE,
-		x"1" when others; -- private reset/TOC acquisition
-
-	-- FIFO writes, replay state, drain progress and empty-FIFO wait cycles.
-	-- Waiting for data does not reduce READ_SKIP.
-	DBG_CMD_LEDGER <= std_logic_vector(CNT_FIFOWR)
-	                & READ_ACTIVE & RP_TAILDRAIN & RP_ENC
-	                & std_logic_vector(RSKIP_STARVE)
-	                & std_logic_vector(SWALLOW)
-	                & RP_FREEZE & SLEEP & RSKIP_GAP & EMPTY
-	                & std_logic_vector(READ_SKIP);
-
-	iSS_SCSI_DBG : entity work.eReg_SavestateV
-	generic map ( Adr => 65, def => SSREG_DEFAULT_CD )
-	port map (
-		clk      => CLK,
-		BUS_Din  => SaveStateBus_Din,
-		BUS_Adr  => SaveStateBus_Adr,
-		BUS_wren => SaveStateBus_wren,
-		BUS_rst  => SaveStateBus_rst,
-		BUS_Dout => SS_V_Dout_DBG,
-		Din      => std_logic_vector(CNT_STATPEND) & std_logic_vector(CNT_MSGIN)
-		          & std_logic_vector(CNT_SEL) & std_logic_vector(CNT_STATGET) & SP_HIST,
-		Dout     => open
-	);
-
-	-- eReg 66: handshake ledger.
-	--   15:0 REQ assert edges, 31:16 ACK assert edges, 35:32 SP at last ACK,
-	--   36 RP_RETRY_AGE(27), 37 RP_RETRY_RUN, 38 RP_RETRIED, 39 RP_AUD_DONE,
-	--   47:40 drive bytes/256, 55:48 COMM_SEND pulses, 59:56 SP at last REQ,
-	--   63:60 RP_ISSUE entries (saturating).
-	process(CLK) begin
-		if rising_edge(CLK) then
-			if RESET_N = '0' then
-				CNT_REQ <= (others => '0'); CNT_ACK <= (others => '0');
-				CNT_FIFOWR <= (others => '0'); CNT_COMMSEND <= (others => '0');
-			else
-				DBG_REQ_D <= REQ_Nr;
-				if REQ_Nr = '0' and DBG_REQ_D = '1' then
-					CNT_REQ <= CNT_REQ + 1; LAST_REQ_SP <= SP_ENC;
-				end if;
-				DBG_ACK_D <= ACK_N;
-				if ACK_N = '0' and DBG_ACK_D = '1' then
-					CNT_ACK <= CNT_ACK + 1; LAST_ACK_SP <= SP_ENC;
-				end if;
-				-- Quartus 17 cannot read out ports: use internal drivers only.
-				DBG_DE_D <= FIFO_WR_REQ;
-				if FIFO_WR_REQ = '1' and DBG_DE_D = '0' then
-					CNT_FIFOWR <= CNT_FIFOWR + 1;	-- drive bytes pushed (wraps)
-				end if;
-				DBG_CS_D <= COMM_OUT or RP_SEND;
-				if (COMM_OUT or RP_SEND) = '1' and DBG_CS_D = '0' and CNT_COMMSEND /= x"FF" then
-					CNT_COMMSEND <= CNT_COMMSEND + 1;
-				end if;
-			end if;
-		end if;
-	end process;
-
-	iSS_SCSI_DBG2 : entity work.eReg_SavestateV
-	generic map ( Adr => 66, def => SSREG_DEFAULT_CD )
-	port map (
-		clk      => CLK,
-		BUS_Din  => SaveStateBus_Din,
-		BUS_Adr  => SaveStateBus_Adr,
-		BUS_wren => SaveStateBus_wren,
-		BUS_rst  => SaveStateBus_rst,
-		BUS_Dout => SS_V_Dout_DBG2,
-		Din      => std_logic_vector(CNT_RPISSUE) & LAST_REQ_SP & std_logic_vector(CNT_COMMSEND)
-		          & std_logic_vector(CNT_FIFOWR(15 downto 8))
-		          & RP_AUD_DONE & RP_RETRIED & RP_RETRY_RUN & RP_RETRY_AGE(27) & LAST_ACK_SP
-		          & std_logic_vector(CNT_ACK) & std_logic_vector(CNT_REQ),
-		Dout     => open
-	);
-
 	SaveStateBus_Dout <= SS_V_Dout(0) or SS_V_Dout(1) or SS_V_Dout(2)
-	                  or SS_V_Dout(3) or SS_V_Dout(4) or SS_V_Dout(5)
-	                  or SS_V_Dout_DBG or SS_V_Dout_DBG2
-	                  or SS_V_Dout_AUD_STOP or SS_V_Dout_AUD_EVENTS;
+	                  or SS_V_Dout(3) or SS_V_Dout(4) or SS_V_Dout(5);
 
 	-- Replay, drains and pending replay/audio statuses block capture.
 	-- An active READ6 can be reconstructed even with unread FIFO data.

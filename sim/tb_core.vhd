@@ -375,18 +375,7 @@ begin
 				severity failure;
 			diff := 0;
 			for w in 1 to SLOT_WORDS-1 loop
-				if w = 48 then
-					-- internals slot 47 = TOP_EXT: bits 63:40 are live
-					-- slot-selection telemetry (save/load counters), naturally
-					-- different between the reference and replay saves
-					if (slot_word(1, w) and x"000000FFFFFFFFFF")
-					 /= (slot_word(2, w) and x"000000FFFFFFFFFF") then
-						diff := diff + 1;
-						report "TBC: TOP_EXT non-telemetry fields differ: ref="
-							& to_hstring(slot_word(1, w)) & " replay=" & to_hstring(slot_word(2, w))
-							severity error;
-					end if;
-				elsif w = 25 then
+				if w = 25 then
 					if (slot_word(1, w) and PHASE_MASK) /= (slot_word(2, w) and PHASE_MASK) then
 						diff := diff + 1;
 						report "TBC: VCE_2 non-phase fields differ: ref="
@@ -420,10 +409,6 @@ begin
 						diff := diff + 1;
 						report "TBC: inactive CD data fields differ" severity error;
 					end if;
-				elsif (w >= 66 and w <= 72) or (w >= 75 and w <= 84) then
-					-- Save-only eRegs 65..71 and 74..83 have Dout=>open.
-					-- They count the additional load/PAUSE; they are not restored.
-					null;
 				elsif slot_word(1, w) /= slot_word(2, w) then
 					diff := diff + 1;
 					if diff <= 16 then
@@ -438,7 +423,7 @@ begin
 
 			assert diff = 0
 				report "TBC FAILED: " & integer'image(diff) & " differing words" severity failure;
-			report "TBC PASSED: HuCard CPU/video/RAM replay matches; inactive CD phases and telemetry excluded";
+			report "TBC PASSED: HuCard CPU/video/RAM replay matches; inactive CD phases excluded";
 			std.env.finish;
 		end process;
 

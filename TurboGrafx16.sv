@@ -315,7 +315,6 @@ wire [63:0] sse_din, sse_dout_ext;
 wire  [9:0] sse_adr;
 wire        sse_wren, sse_rst, sse_load;
 wire [63:0] ss_top_ext;
-wire  [8:0] ss_dbg;		// boundary-block telemetry from pce_top
 wire        ss_ac_used;	// game actually touched the Arcade Card
 
 reg rom_loaded = 0;
@@ -424,7 +423,6 @@ pce_top #(.LITE(LITE)) pce_top
 	.SSE_rst(sse_rst),
 	.SSE_load(sse_load),
 	.SSE_Dout(sse_dout_ext),
-	.SS_DBG(ss_dbg),
 	.SS_AC_USED(ss_ac_used),
 
 	.ROM_RD(rom_rd),
@@ -1063,25 +1061,7 @@ reg       high_buttons = 0;
 // TOP_EXT eReg (slot 47): input-block state over the exported bus.
 // Layout (pce_savestates_pkg): high_buttons(0), joy_port(3:1), joy_latch(7:4),
 // scan_counter(11:8), joyrept_0..4(21:12), last_gp(23:22).
-// Save-only diagnostics, not restored:
-//   [47:40] dbg_save_cnt   ss_save pulses seen at the top level
-//   [55:48] dbg_load_cnt   ss_load pulses
-//   [57:56] dbg_last_slot  ss_slot at the last ss_save/ss_load pulse
-//   [59:58] ss_slot        live at blob-walk time (= savestate_ui ss_base)
-//   [61:60] status[46:45]  live OSD slot bits from the HPS
-//   [32:24] SS_DBG         forced flag + boundary-block terms at the last
-//                          failed check: {forced, !state0, res_int, cpu_ce,
-//                          !vbl, busy0, busy1, ext_hold, cd_hold}
-reg [7:0] dbg_save_cnt = 0, dbg_load_cnt = 0;
-reg [1:0] dbg_last_slot = 0;
-always @(posedge clk_sys) begin
-	if (ss_save) begin dbg_save_cnt <= dbg_save_cnt + 1'd1; dbg_last_slot <= ss_slot; end
-	if (ss_load) begin dbg_load_cnt <= dbg_load_cnt + 1'd1; dbg_last_slot <= ss_slot; end
-end
-
-wire [63:0] ss_top_ext_back = {2'd0, status[46:45], ss_slot, dbg_last_slot,
-                               dbg_load_cnt, dbg_save_cnt,
-                               7'd0, ss_dbg,
+wire [63:0] ss_top_ext_back = {40'd0,
                                last_gp, joyrept_4, joyrept_3, joyrept_2,
                                joyrept_1, joyrept_0, scan_counter, joy_latch,
                                joy_port, high_buttons};

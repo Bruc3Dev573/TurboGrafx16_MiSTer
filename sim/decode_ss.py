@@ -82,71 +82,10 @@ def decode(words):
     print(f"TOP: rombank={bits(top,1,0)}  EXT: high_btn={bits(ext,0,0)} joy_port={bits(ext,3,1)} "
           f"latch={bits(ext,7,4):X} scan={bits(ext,11,8):X}")
 
-def cd_timeline(words):
-    """Decode the CD interface timeline that every savestate carries (eReg 68).
-
-    This is what makes a blocked machine diagnosable from a plain save: the CD
-    block keeps a second-resolution record of when a status last arrived, when
-    a command was last sent, how long the drive kept streaming audio, and when
-    the last restore happened. Comparing those four instants against each other
-    says which side of the interface stopped talking, without any access to the
-    board.
-    """
-    def s(i):
-        return words[1 + i] if 1 + i < len(words) else 0
-
-    dbg = s(68)
-    if dbg == 0:
-        print("\nCD timeline: not present (blob predates the forensic register)")
-        return
-
-    sec = bits(dbg, 15, 0)
-    t_stat, t_comm = bits(dbg, 23, 16), bits(dbg, 31, 24)
-    t_cdda, t_load = bits(dbg, 39, 32), bits(dbg, 47, 40)
-    rstcnt, statcnt = bits(dbg, 55, 48), bits(dbg, 63, 56)
-
-    # Each instant is stored as the low 8 bits of the second counter, so it is
-    # only meaningful as a distance back from the save, and only within the last
-    # 256 seconds. That is the window a hang lives in, so it is enough - but an
-    # absolute "T+83s" would be a lie whenever the machine has been up longer.
-    def ago(stamp):
-        return (sec - stamp) & 0xFF
-
-    def show(label, stamp, seen=None):
-        # Second 0 is before the machine has run at all, so a zero stamp means
-        # the event never happened rather than "at the very beginning".
-        if stamp == 0:
-            print(f"  {label:<28} never")
-            return
-        age = ago(stamp)
-        note = f"   ({seen} in all)" if seen is not None else ""
-        print(f"  {label:<28} {age:>3}s before the save{note}")
-
-    print(f"\nCD timeline (eReg 68), machine up {sec}s, instants below are "
-          f"distances back from the save (8-bit seconds, wraps at 256):")
-    show("status from the drive", t_stat, f"{statcnt} arrived")
-    show("command onto the bus", t_comm)
-    show("CDDA sample streamed", t_cdda)
-    show("restore", t_load)
-    print(f"  {'drive resets by the game':<28} {rstcnt}")
-
-    if t_load == 0:
-        print("  -> no restore has happened yet: this is a source state, not a post-load state")
-        return
-    if ago(t_stat) < ago(t_load):
-        print("  -> a status did arrive after the last restore")
-    else:
-        print("  -> NO status arrived after the last restore: the drive went "
-              "silent across the load")
-    if ago(t_comm) > 3 and ago(t_stat) > 3:
-        print(f"  -> both sides quiet for {min(ago(t_stat), ago(t_comm))}s before "
-              f"the save: the interface was parked, not busy")
-
-
 def cd_registers(words):
-    """Raw CD/SCSI savestate registers, for when the timeline is not enough."""
+    """Raw functional CD/SCSI savestate registers."""
     print("\nCD/SCSI registers (raw):")
-    for index in range(53, 69):
+    for index in range(53, 65):
         word = words[1 + index] if 1 + index < len(words) else 0
         print(f"  eReg {index:>3} {word:016X}")
 
@@ -194,7 +133,6 @@ if __name__ == "__main__":
     try:
         words, data = load(sys.argv[1])
         decode(words)
-        cd_timeline(words)
         if "--regs" in sys.argv:
             cd_registers(words)
         if data is not None:

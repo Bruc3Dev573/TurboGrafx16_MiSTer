@@ -141,7 +141,8 @@ package pPCE_savestates is
    -- 55 SCSI_1: SP(3:0) [enum pos], BSY_Nr(4), MSG_Nr(5), CD_Nr(6), IO_Nr(7),
    --   REQ_Nr(8), COMM_POS(12:9), DATA_POS(16:13), STOP_CD_SND(17),
    --   STAT_PEND(18), DOUT_PEND(19), CD_WR_OLD(20), DBO(31:24),
-   --   DATAIN_CNT(47:32), FIFO_D(55:48), AUDIO_MODE(57:56), AUDIO_ACTIVE(58)
+   --   DATAIN_CNT(47:32), FIFO_D(55:48), AUDIO_MODE(57:56), AUDIO_ACTIVE(58),
+   --   QRY_ACTIVE(59), AUD_OPEN(60), AUD_LAST(62:61)
    -- 56 SCSI_2: STAT_COUNT(15:0), DELAY_COUNT(31:16) [17b reg, max 49400],
    --   AUDIO_B2..B5 (raw SAPSP bytes 2-5) at (39:32)(47:40)(55:48)(63:56)
    -- 57 SCSI_COMM_LO: COMM(0)..COMM(7), byte i at (i*8+7 : i*8)
@@ -158,9 +159,9 @@ package pPCE_savestates is
    --   SUBCD_CE_OLD(33), SUBCD_WR_OLD(34), OUTL(50:35)
    -- 63 CD_6: OUTR(15:0), FADE_VOL(26:16), CDDA_CONSUMED(58:27)
    --
-   -- Not saved: the three FIFOs (CD-quiet boundary guarantees SCSI_FIFO
-   -- empty; CDDA/SUBC refill from the stream), FIFO_* strobes, CEGen
-   -- CLK_SUM phases.
+   -- Not saved: the three FIFOs. READ6 replay refills unread SCSI data;
+   -- other commands require an empty SCSI FIFO at the boundary. CDDA and
+   -- subcode refill from the stream. FIFO strobes and CEGen phases are rebuilt.
    constant SSREG_INDEX_CD_1        : integer := 53;
    constant SSREG_INDEX_CD_2        : integer := 54;
    constant SSREG_INDEX_SCSI_1      : integer := 55;

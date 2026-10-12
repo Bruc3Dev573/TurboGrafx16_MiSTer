@@ -38,7 +38,6 @@ architecture sim of tb_brm is
 	signal ss_slot  : std_logic_vector(1 downto 0) := "00";
 	signal ss_busy  : std_logic;
 	signal ss_sleep : std_logic;
-	signal ss_dbg   : std_logic_vector(8 downto 0);
 
 	signal ddr_din  : std_logic_vector(63 downto 0);
 	signal ddr_dout : std_logic_vector(63 downto 0) := (others => '0');
@@ -168,7 +167,6 @@ begin
 		SS_ACTIVE_SLOT => open,
 		SS_ACTIVE_LOAD => open,
 		SS_SLEEP    => ss_sleep,
-		SS_DBG      => ss_dbg,
 		SS_DDR_DIN  => ddr_din,
 		SS_DDR_DOUT => ddr_dout,
 		SS_DDR_ADDR => ddr_adr,
@@ -299,11 +297,9 @@ begin
 				for i in 1 to 400 loop
 					wait until ss_sleep = '1' for 5 ms;
 					exit when ss_sleep = '1';
-					report "TBBRM WAIT(" & tag & ") SS_DBG=" & to_string(ss_dbg);
 				end loop;
 				assert ss_sleep = '1'
-					report "TBBRM HANG(" & tag & "): freeze never engaged; SS_DBG="
-						& to_string(ss_dbg) severity failure;
+					report "TBBRM HANG(" & tag & "): freeze never engaged" severity failure;
 				wait until ss_sleep = '0' for 500 ms;
 				assert ss_sleep = '0'
 					report "TBBRM HANG(" & tag & "): walk never completed" severity failure;

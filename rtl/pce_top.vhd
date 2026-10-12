@@ -114,10 +114,6 @@ entity pce_top is
 		SSE_rst		: out std_logic;
 		SSE_load		: out std_logic;
 		SSE_Dout		: in  std_logic_vector(63 downto 0) := (others => '0');
-		-- boundary-block telemetry: one-hot of the composite terms that were
-		-- blocking at the last failed check while a freeze was pending, plus
-		-- the forced flag - turns a wedged boundary into a one-dump diagnosis
-		SS_DBG		: out std_logic_vector(8 downto 0);
 		-- sticky: the game actually touched the Arcade Card (regs or RAM)
 		SS_AC_USED	: out std_logic;
 
@@ -309,7 +305,6 @@ signal ss_walk_sleep     : std_logic;	-- freeze, restore and refetch; exported a
 signal ss_audio_hold     : std_logic;	-- post-load CDDA hold from the CD unit
 signal ss_saving         : std_logic;
 signal ss_forced         : std_logic := '0';
-signal ss_dbg_block      : std_logic_vector(7 downto 0) := (others => '0');
 signal ss_ac_used_r      : std_logic := '0';
 signal ss_arcade_loaded  : std_logic;
 signal ss_save_abort     : std_logic;
@@ -326,10 +321,6 @@ signal ss_cdr_wdata      : std_logic_vector(7 downto 0);
 signal ss_cdr_rd         : std_logic;
 signal ss_cdr_wr         : std_logic;
 signal ss_cdr_kick       : std_logic;
-signal ss_cdr_dbg_ns     : unsigned(15 downto 0) := (others => '0');	-- reads sampled with no rdy dip seen
-signal ss_cdr_dbg_to     : unsigned(7 downto 0) := (others => '0');	-- 255-CLK timeouts
-signal ss_cdr_dbg_max    : unsigned(7 downto 0) := (others => '0');	-- slowest byte (cnt at sample)
-signal SS_Dout_CDRDBG    : std_logic_vector(63 downto 0);
 signal SS_Dout_AC        : std_logic_vector(63 downto 0);
 signal ss_ram_rdy        : std_logic;
 signal VRAM0_QB          : std_logic_vector(15 downto 0);
@@ -977,8 +968,7 @@ port map (
 	walk_q => ss_cdr_data, walk_ready => ss_ram_rdy, active => ss_cdr_act,
 	ram_addr => ss_cdr_addr, ram_data => ss_cdr_wdata, ram_q => CD_RAM_DI,
 	ram_ready => ROM_RDY, ram_rd => ss_cdr_rd, ram_wr => ss_cdr_wr,
-	kick => ss_cdr_kick, debug_no_dip => ss_cdr_dbg_ns,
-	debug_timeout => ss_cdr_dbg_to, debug_max => ss_cdr_dbg_max
+	kick => ss_cdr_kick
 );
 
 AC : ARCADE_CARD
@@ -1048,13 +1038,6 @@ process( CLK ) begin
 		elsif ss_frozen = '0' then
 			-- The machine continues running while the boundary is unavailable.
 			ss_wd <= ss_wd + 1;
-			-- snapshot WHICH terms block ('1' = this term is the blocker)
-			-- bit 7 = CPU not idle; bit 6 retired with SS_RES_INT, kept at 0 so
-			-- the other blockers keep their eReg 47 bit positions
-			ss_dbg_block <= (not ss_bnd_idle) & '0' & CPU_CE
-			              & (not video_vbl_i)
-			              & ss_busy0 & ss_busy1
-			              & SS_EXT_HOLD & ss_cd_hold;
 			if ss_boundary = '1' or ss_wd(27) = '1' then
 				ss_frozen <= '1';
 				ss_forced <= ss_wd(27);	-- watchdog-forced (non-boundary) freeze
@@ -1185,30 +1168,13 @@ port map (
 	Dout     => SS_TOP
 );
 
--- Save-only region-10 diagnostics: bits 15:0 count reads without a ROM_RDY
--- dip, 23:16 count 255-clock timeouts, 31:24 hold the longest byte latency.
-iREG_SS_CDRDBG : entity work.eReg_SavestateV
-generic map ( Adr => 67, def => (63 downto 0 => '0') )
-port map (
-	clk      => CLK,
-	BUS_Din  => SaveStateBus_Din,
-	BUS_Adr  => SaveStateBus_Adr,
-	BUS_wren => SaveStateBus_wren,
-	BUS_rst  => SaveStateBus_rst,
-	BUS_Dout => SS_Dout_CDRDBG,
-	Din      => x"00000000" & std_logic_vector(ss_cdr_dbg_max)
-	          & std_logic_vector(ss_cdr_dbg_to) & std_logic_vector(ss_cdr_dbg_ns),
-	Dout     => open
-);
-
 -- Wired-OR of all module BUS_Dout contributors (eReg drives 0 when not addressed).
 SaveStateBus_Dout <= SS_Dout_TOP or SS_Dout_VCE or SS_Dout_CPU
                   or SS_Dout_VDC0 or SS_Dout_VDC1 or SS_Dout_VPC
-                  or SS_Dout_CD or SS_Dout_AC or SSE_Dout or SS_Dout_CDRDBG;
+                  or SS_Dout_CD or SS_Dout_AC or SSE_Dout;
 
 -- SaveStateBus export towards TurboGrafx16.sv (TOP_EXT input-block eReg)
 SSE_Din  <= SaveStateBus_Din;
-SS_DBG   <= ss_forced & ss_dbg_block;
 
 -- Capture Arcade Card state once the game writes a register or accesses RAM.
 -- Restore the saved usage flag so subsequent saves retain the same regions.

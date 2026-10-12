@@ -12,7 +12,7 @@
 --    value n mod 65536 on both channels);
 --  * a shared ROM/CD-RAM data port matching TurboGrafx16.sv: one data
 --    register, rom_rd raddr priority and ce_rom pacing;
---  * savestate watchdogs that print the SS_DBG boundary-block mask on timeout.
+--  * savestate watchdogs for freeze and walk/refetch timeouts.
 --
 -- Scenarios:
 --  A. exec-from-CD-RAM determinism: save/run/save/load/run/save + compare.
@@ -201,7 +201,7 @@ architecture sim of tb_cd is
 	signal ss_slot  : std_logic_vector(1 downto 0) := "00";
 	signal ss_busy  : std_logic;
 	signal ss_sleep : std_logic;
-	signal ss_dbg   : std_logic_vector(8 downto 0);
+	signal l_cnt_req, l_cnt_ack : unsigned(15 downto 0) := (others => '0');
 
 	signal ddr_din  : std_logic_vector(63 downto 0);
 	signal ddr_dout : std_logic_vector(63 downto 0) := (others => '0');
@@ -1298,7 +1298,6 @@ begin
 		SS_ACTIVE_SLOT => open,
 		SS_ACTIVE_LOAD => open,
 		SS_SLEEP    => ss_sleep,
-		SS_DBG      => ss_dbg,
 		SS_DDR_DIN  => ddr_din,
 		SS_DDR_DOUT => ddr_dout,
 		SS_DDR_ADDR => ddr_adr,
@@ -2163,11 +2162,38 @@ begin
 	end process;
 
 	-- ------------------------------------------------------------------
+	-- K/L observe the same falling edges and synchronous reset as the
+	-- former RTL counters. Edge history is retained across reset and load.
+	handshake_mon : process
+		alias scsi_clk is << signal .tb_cd.DUT.CD.SCSI.CLK : std_logic >>;
+		alias reset_n is << signal .tb_cd.DUT.CD.SCSI.RESET_N : std_logic >>;
+		alias req_n is << signal .tb_cd.DUT.CD.SCSI.REQ_Nr : std_logic >>;
+		alias ack_n is << signal .tb_cd.DUT.CD.SCSI.ACK_N : std_logic >>;
+		variable req_d, ack_d : std_logic := '1';
+	begin
+		loop
+			wait until rising_edge(scsi_clk);
+			if reset_n = '0' then
+				l_cnt_req <= (others => '0');
+				l_cnt_ack <= (others => '0');
+			else
+				if req_n = '0' and req_d = '1' then
+					l_cnt_req <= l_cnt_req + 1;
+				end if;
+				if ack_n = '0' and ack_d = '1' then
+					l_cnt_ack <= l_cnt_ack + 1;
+				end if;
+				req_d := req_n;
+				ack_d := ack_n;
+			end if;
+		end loop;
+	end process;
+
+	-- ------------------------------------------------------------------
 	-- A restored query may legitimately hold BSY while SP_FREE waits for data.
 	-- Detect instead a bus with no recorded work that can complete its
 	-- transaction. Arm after load; ignore frozen cycles and debounce transient
 	-- register updates. Scenario progress checks also cover unfulfilled debts.
-	-- ------------------------------------------------------------------
 	cp_mon : process
 		alias bsyn   is << signal .tb_cd.DUT.CD.SCSI.BSY_Nr : std_logic >>;
 		alias spenc2 is << signal .tb_cd.DUT.CD.SCSI.SP_ENC : std_logic_vector(3 downto 0) >>;
@@ -2179,7 +2205,7 @@ begin
 		alias doutp  is << signal .tb_cd.DUT.CD.SCSI.DOUT_PEND : std_logic >>;
 		alias emp    is << signal .tb_cd.DUT.CD.SCSI.EMPTY : std_logic >>;
 		alias cmdout is << signal .tb_cd.DUT.CD.SCSI.CMD_OUTST : std_logic >>;
-		alias rpenc  is << signal .tb_cd.DUT.CD.SCSI.RP_ENC : std_logic_vector(3 downto 0) >>;
+		alias quiet  is << signal .tb_cd.DUT.CD.SCSI.SS_QUIET : std_logic >>;
 		alias rskip  is << signal .tb_cd.DUT.CD.SCSI.READ_SKIP : unsigned(11 downto 0) >>;
 		alias swal   is << signal .tb_cd.DUT.CD.SCSI.SWALLOW : unsigned(1 downto 0) >>;
 		constant DEBOUNCE : integer := 4096;	-- 41 us of tb clock
@@ -2189,11 +2215,13 @@ begin
 		loop
 			wait until rising_edge(clk);
 			if ssload = '1' then armed := true; end if;
+			-- With the no-work predicates below, SS_QUIET is true exactly
+			-- when replay is idle.
 			if armed and ss_sleep = '0'
 			   and spenc2 = x"0" and bsyn = '0'
 			   and cract = '0' and qry = '0' and audop = '0'
 			   and statp = '0' and doutp = '0' and emp = '1'
-			   and cmdout = '0' and rpenc = x"0"
+			   and cmdout = '0' and quiet = '1'
 			   and rskip = 0 and swal = 0 then
 				held := held + 1;
 			else
@@ -2503,10 +2531,6 @@ begin
 		-- W2 counters: REQ/ACK, swallow, status strobes/pends, mailbox/SEL.
 		alias wswl is << signal .tb_cd.DUT.CD.SCSI.SWALLOW : unsigned(1 downto 0) >>;
 		alias wstp is << signal .tb_cd.DUT.CD.SCSI.STAT_PEND : std_logic >>;
-		alias wnrq is << signal .tb_cd.DUT.CD.SCSI.CNT_REQ : unsigned(15 downto 0) >>;
-		alias wnak is << signal .tb_cd.DUT.CD.SCSI.CNT_ACK : unsigned(15 downto 0) >>;
-		alias wnsp is << signal .tb_cd.DUT.CD.SCSI.CNT_STATPEND : unsigned(7 downto 0) >>;
-		alias wncs is << signal .tb_cd.DUT.CD.SCSI.CNT_COMMSEND : unsigned(7 downto 0) >>;
 		alias wsel is << signal .tb_cd.DUT.CD.SCSI.SEL_N : std_logic >>;
 		variable prev : std_logic_vector(15 downto 0) := (others => '0');
 		variable seen : integer := 0;
@@ -2518,12 +2542,10 @@ begin
 			report "TBCD W2 TALLY [" & name & "]: SWALLOW=" & integer'image(to_integer(wswl))
 				& " STAT_PEND=" & std_logic'image(wstp)
 				& " STAT_GETS=" & integer'image(nstatget)
-				& " STAT_PENDS=" & integer'image(to_integer(wnsp))
 				& " MBOX=" & integer'image(mbox_count)
-				& " COMMSENDS=" & integer'image(to_integer(wncs))
 				& " SELS=" & integer'image(nsel)
-				& " REQ=" & integer'image(to_integer(wnrq))
-				& " ACK=" & integer'image(to_integer(wnak))
+				& " REQ=" & integer'image(to_integer(l_cnt_req))
+				& " ACK=" & integer'image(to_integer(l_cnt_ack))
 				& " SLOT=" & std_logic'image(hps_slot)
 				& " LOST=" & integer'image(w3_lost)
 				& " t=" & time'image(now);
@@ -2928,22 +2950,17 @@ begin
 				wait_cycles(3);
 				ss_load <= '0'; ss_save <= '0';
 				t0 := now;
-				-- wait for the freeze, reporting the boundary-block mask
-				-- every 5 sim-ms: the mask is the live diagnosis of WHICH
-				-- composite term keeps the boundary rare
+				-- Wait for freeze, reporting elapsed time every 5 sim-ms.
 				for i in 1 to max_wait loop
 					wait until ss_sleep = '1' for 5 ms;
 					exit when ss_sleep = '1';
-					report "TBCD WAIT(" & tag & ") t=" & time'image(now - t0)
-						& " SS_DBG(frc,!st0,res,ce,!vbl,b0,b1,ext,cd)=" & to_string(ss_dbg);
+					report "TBCD WAIT(" & tag & ") t=" & time'image(now - t0);
 				end loop;
 				assert ss_sleep = '1'
-					report "TBCD HANG(" & tag & "): freeze never engaged; SS_DBG="
-						& to_string(ss_dbg) severity failure;
+					report "TBCD HANG(" & tag & "): freeze never engaged" severity failure;
 				wait until ss_sleep = '0' for 500 ms;
 				assert ss_sleep = '0'
-					report "TBCD HANG(" & tag & "): walk/refetch never completed; SS_DBG="
-						& to_string(ss_dbg) severity failure;
+					report "TBCD HANG(" & tag & "): walk/refetch never completed" severity failure;
 				report "TBCD: " & tag & " ok (" & time'image(now - t0) & ")";
 				if not is_load then
 					-- eReg 0 = CPU_1: bits 52:48 STATE, 47:40 IR.  A blob with
@@ -3017,10 +3034,6 @@ begin
 			-- RP_CONS and divides by 588 to rebuild the position, so it is the
 			-- same number the RTL decides on.
 			alias k_cons is << signal .tb_cd.DUT.CD.CDDA_CONSUMED : unsigned(31 downto 0) >>;
-			-- L checks handshake progress. K uses the same ACK counter to
-			-- ensure replay status never reaches the program.
-			alias l_cnt_req is << signal .tb_cd.DUT.CD.SCSI.CNT_REQ : unsigned(15 downto 0) >>;
-			alias l_cnt_ack is << signal .tb_cd.DUT.CD.SCSI.CNT_ACK : unsigned(15 downto 0) >>;
 			alias j_pc is << signal .tb_cd.DUT.CPU.CORE.PC : std_logic_vector(15 downto 0) >>;
 			-- J/J2 handled-interrupt counter out of the latest slot-3 blob:
 			-- $2030 (IRQ1, byte 0) or $2033 (IRQ2, byte 3) of region word 129+6
@@ -3111,23 +3124,14 @@ begin
 					 /= (slot_word(2, w) and x"FFF88FFFFFFFF000") then
 						diff := diff + 1;
 					end if;
-				elsif w = 48 then
-					if (slot_word(1, w) and x"000000FFFFFFFFFF")
-					 /= (slot_word(2, w) and x"000000FFFFFFFFFF") then
-						diff := diff + 1;
-					end if;
 				elsif w = 56 then
-					-- word index = eReg + 1 (word 0 is the header).  eReg 55 =
-					-- SCSI_1: mask diagnostic starvation taps (63:60), which
-					-- track elapsed activity rather than restored machine state.
+					-- SCSI_1: this comparison excludes audio-response bookkeeping
+					-- (AUD_OPEN and AUD_LAST in bits 62:60).
 					if (slot_word(1, w) and x"0FFFFFFFFFFFFFFF")
 					 /= (slot_word(2, w) and x"0FFFFFFFFFFFFFFF") then
 						diff := diff + 1;
-						report "TBCD A: SCSI_1 non-forensic fields differ" severity error;
+						report "TBCD A: SCSI_1 compared fields differ" severity error;
 					end if;
-				elsif w = 66 or w = 67 then
-					-- Skip save-only phase and REQ/ACK counters (eRegs 65/66).
-					null;
 				elsif slot_word(1, w) /= slot_word(2, w) then
 					diff := diff + 1;
 					if diff <= 12 then
