@@ -19,7 +19,6 @@ set_global_assignment -name VHDL_FILE rtl/pce_savestates_pkg.vhd
 set_global_assignment -name VHDL_FILE rtl/savestates.vhd
 set_global_assignment -name VHDL_FILE rtl/statemanager.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate_ui.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/pce_savestates.sv
 set_global_assignment -name VHDL_FILE rtl/ss_external_ram.vhd
 set_global_assignment -name VHDL_FILE rtl/pce_top.vhd
 set_global_assignment -name SDC_FILE TurboGrafx16.sdc

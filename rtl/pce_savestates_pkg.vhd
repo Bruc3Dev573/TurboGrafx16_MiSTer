@@ -2,7 +2,6 @@
 --
 -- Companion of the Robert Peip savestate framework (bus_savestates.vhd,
 -- savestates.vhd, statemanager.vhd, adapted from NES_MiSTer).
--- Keep the SystemVerilog mirror rtl/pce_savestates.sv in sync.
 --
 -- Bus: 64-bit data, 10-bit address (pBus_savestates).
 --
