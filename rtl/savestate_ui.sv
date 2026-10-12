@@ -1,14 +1,14 @@
 module savestate_ui #(parameter INFO_TIMEOUT_BITS)
 (
-	input            clk,    
-   input     [10:0] ps2_key,     
-	input            allow_ss,    
-	input            joySS   ,    
-	input            joyRight,    
-	input            joyLeft ,    
-	input            joyDown ,    
-	input            joyUp   ,    
-	input      [1:0] status_slot, 
+	input            clk,
+   input     [10:0] ps2_key,
+	input            allow_ss,
+	input            joySS   ,
+	input            joyRight,
+	input            joyLeft ,
+	input            joyDown ,
+	input            joyUp   ,
+	input      [1:0] status_slot,
 	input      [1:0] OSD_saveload,
 	output reg       ss_save,
 	output reg       ss_load,
@@ -50,19 +50,19 @@ always @(posedge clk) begin
 	old_state <= ps2_key[10];
 	if (old_state != ps2_key[10] && ps2_key[7:0] == 8'h11)
 		alt <= pressed;
-	
+
 	lastRight <= joyRight;
-	lastLeft  <= joyLeft; 
-	lastDown  <= joyDown; 
-	lastUp    <= joyUp;   
-	
+	lastLeft  <= joyLeft;
+	lastDown  <= joyDown;
+	lastUp    <= joyUp;
+
 	slotswitched <= 1'b0;
-	
+
 	ss_save      <= 1'b0;
 	ss_load      <= 1'b0;
 	ss_info_req  <= 1'b0;
 	statusUpdate <= 1'b0;
-	
+
 	lastOSDsetting <= status_slot;
 
 	// HPS restores the selected slot before a game is mounted.
@@ -82,7 +82,7 @@ always @(posedge clk) begin
 				'h0C: begin ss_save <= pressed & alt; ss_load <= pressed & ~alt; ss_base <= 3; statusUpdate <= 1'b1; end // F4
 			endcase
 		end
-		
+
 		// gamepad
 		if (joySS) begin
 			// timeout with no button pressed -> help text
@@ -117,7 +117,7 @@ always @(posedge clk) begin
 		end else begin
 			InfoWaitcnt <= 25'b0;
 		end
-		
+
 		// OSD
 		old_st <= OSD_saveload;
 		if(old_st[0] ^ OSD_saveload[0]) ss_save <= OSD_saveload[0];
@@ -145,4 +145,3 @@ always @(posedge clk) begin
 end
 
 endmodule
-

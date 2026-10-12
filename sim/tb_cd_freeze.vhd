@@ -51,6 +51,7 @@ begin
   CD_DATA => cd_data, CD_DATA_WR => cd_data_wr, CD_AUDIO_WR => cd_audio_wr,
   CD_SUBCD_WR => cd_subcd_wr, CD_DATA_END => open, DM => '0',
   CD_SL => cd_sl, CD_SR => cd_sr, AD_S => open, SLEEP => sleep,
+  WALK_SLEEP => sleep,
   SaveStateBus_Din => ssb_din, SaveStateBus_Adr => ssb_adr,
   SaveStateBus_wren => ssb_wren, SaveStateBus_rst => '0',
   SaveStateBus_load => ssb_load, SaveStateBus_Dout => ssb_dout,

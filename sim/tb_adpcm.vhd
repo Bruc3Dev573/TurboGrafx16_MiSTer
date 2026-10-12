@@ -2,13 +2,9 @@
 -- tb_adpcm.vhd — fast standalone unit harness for the CD ADPCM engine.
 --
 -- Instantiates rtl/cd/cd.vhd directly and drives the ADPCM registers over the
--- EXT bus (no 6280, no pce_top), so the write/play/read sequence and the
--- decoder-state save/load round-trip iterate in seconds instead of the
--- full-system tb_cd's ~40 minutes.  Purpose: nail the sequence that plays a
--- sample (AD_S non-zero) and prove the ADPCM playback state + ADPCM DRAM
--- survive a savestate save/load (hardware "ADPCM crackle after load" bug,
--- hypothesis b).  Once validated here, the sequence is ported into tb_cd's
--- BIOS for the full-engine D scenario.
+-- EXT bus (no 6280, no pce_top). Checks ADPCM DRAM and playback-state
+-- restoration, including decoder sample/step state, clock phase and
+-- sample-by-sample replay after loading.
 --
 -- CD register window (cd.vhd REG_SEL): EXT_A = 0x1FF800 + reg.
 -- Run: sim/run_tb_adpcm.sh
@@ -56,28 +52,9 @@ architecture sim of tb_adpcm is
 	signal ss_ad_rdd  : std_logic_vector(7 downto 0);
 	signal ss_cd_hold : std_logic;
 
-	signal n_ce, n_mclk, n_vck, n_prp, n_xti : integer := 0;
-
 begin
 
 	clk <= not clk after CLK_PERIOD / 2;
-
-	-- pulse counters for the ADPCM clock chain (single-cycle strobes)
-	mon : process(clk)
-		alias ce   is << signal .tb_adpcm.DUT.ADPCM_CE       : std_logic >>;
-		alias mclk is << signal .tb_adpcm.DUT.M5205_CLK      : std_logic >>;
-		alias vck  is << signal .tb_adpcm.DUT.M5205_VCK_R    : std_logic >>;
-		alias prp  is << signal .tb_adpcm.DUT.PLAY_READ_PEND : std_logic >>;
-		alias xti  is << signal .tb_adpcm.DUT.MSM5205.XTI    : std_logic >>;
-	begin
-		if rising_edge(clk) then
-			if ce   = '1' then n_ce   <= n_ce   + 1; end if;
-			if mclk = '1' then n_mclk <= n_mclk + 1; end if;
-			if vck  = '1' then n_vck  <= n_vck  + 1; end if;
-			if prp  = '1' then n_prp  <= n_prp  + 1; end if;
-			if xti  = '1' then n_xti  <= n_xti  + 1; end if;
-		end if;
-	end process;
 
 	DUT : entity work.cd
 	port map (
@@ -115,6 +92,7 @@ begin
 		CD_SR       => cd_sr,
 		AD_S        => ad_s,
 		SLEEP             => sleep,
+		WALK_SLEEP        => sleep,
 		SaveStateBus_Din  => ssb_din,
 		SaveStateBus_Adr  => ssb_adr,
 		SaveStateBus_wren => ssb_wren,
@@ -140,9 +118,6 @@ begin
 		alias a_freq  is << signal .tb_adpcm.DUT.ADPCM_FREQ  : std_logic_vector(3 downto 0) >>;
 		alias m_sout  is << signal .tb_adpcm.DUT.M5205_SOUT  : signed(15 downto 0) >>;
 		alias m_ccnt  is << signal .tb_adpcm.DUT.MSM5205.CLK_CNT : unsigned(5 downto 0) >>;
-		alias m_rstn  is << signal .tb_adpcm.DUT.MSM5205.RST_N : std_logic >>;
-		alias m_slp   is << signal .tb_adpcm.DUT.MSM5205.SLEEP : std_logic >>;
-		alias m_ssl   is << signal .tb_adpcm.DUT.MSM5205.SS_load : std_logic >>;
 		alias m_vck   is << signal .tb_adpcm.DUT.M5205_VCK_R : std_logic >>;
 		alias m_sample is << signal .tb_adpcm.DUT.MSM5205.SAMPLE : unsigned(15 downto 0) >>;
 		alias m_step   is << signal .tb_adpcm.DUT.MSM5205.STEP : unsigned(5 downto 0) >>;
@@ -394,18 +369,7 @@ begin
 		wr(16#0D#, 16#20#);		-- bit5=1: PLAY
 		for i in 1 to 12 loop
 			clks(2000);
-			report "TBADP play +" & integer'image(i) & " PLAY=" & std_logic'image(a_play)
-				& " LEN=" & integer'image(to_integer(unsigned(a_len)))
-				& " RDADDR=" & integer'image(to_integer(unsigned(a_rdad)))
-				& " END=" & std_logic'image(a_end)
-				& " M5205=" & integer'image(to_integer(m_sout))
-				& " AD_S=" & integer'image(to_integer(ad_s))
-				& " | nCE=" & integer'image(n_ce) & " nMCLK=" & integer'image(n_mclk)
-				& " nVCK=" & integer'image(n_vck) & " nPRP=" & integer'image(n_prp)
-				& " CLKCNT=" & integer'image(to_integer(m_ccnt))
-				& " nXTI=" & integer'image(n_xti)
-				& " mSLEEP=" & std_logic'image(m_slp) & " mSSL=" & std_logic'image(m_ssl)
-				& " mRSTN=" & std_logic'image(m_rstn);
+			report "TBADP play AD_S=" & integer'image(to_integer(ad_s));
 		end loop;
 
 		-- ================================================================

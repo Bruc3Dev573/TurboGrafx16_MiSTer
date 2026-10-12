@@ -113,8 +113,6 @@ architecture sim of tb_core is
 
 	type mem_t is array (0 to 3*SLOT_WORDS + 64) of std_logic_vector(63 downto 0);
 
-	signal mismatches : integer := 0;
-
 begin
 
 	clk <= not clk after CLK_PERIOD / 2;
@@ -418,7 +416,6 @@ begin
 					end if;
 				end if;
 			end loop;
-			mismatches <= diff;
 			wait_cycles(1);
 
 			assert diff = 0

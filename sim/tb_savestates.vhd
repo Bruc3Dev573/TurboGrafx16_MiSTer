@@ -152,13 +152,11 @@ begin
 	save_abort <= forced;
 
 	SSMAN : entity work.statemanager
-	generic map ( Softmap_SaveState_ADDR => 16#3800000#, Softmap_Rewind_ADDR => 16#3800000# )
+	generic map ( Softmap_SaveState_ADDR => 16#3800000# )
 	port map (
 		clk => clk, reset => reset or inhibit,
-		rewind_on => '0', rewind_active => '0',
 		savestate_number => selected_slot,
 		save => save_btn, load => load_btn,
-		sleep_rewind => open, vsync => '0',
 		request_savestate => req_save,
 		request_loadstate => req_load,
 		request_address   => req_addr,

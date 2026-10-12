@@ -6,7 +6,7 @@ use work.pBus_savestates.all;
 use work.pPCE_savestates.all;
 
 -- Post-load audio hold at the CD unit, SLEEP looped back as in pce_top
--- (SLEEP = walk or SS_AUDIO_HOLD).
+-- (SLEEP = walk or SS_REPLAY_HOLD).
 --   G_CASE 0: silent D8 + D9 resume, audio late        -> release at ready
 --   G_CASE 1: PLAY-mode D8 resume without D9, audio late -> release at ready
 --   G_CASE 2: resume whose audio never arrives          -> watchdog release
@@ -69,12 +69,13 @@ begin
   CD_DATA => cd_data, CD_DATA_WR => '0', CD_AUDIO_WR => cd_audio_wr,
   CD_SUBCD_WR => cd_subcd_wr, CD_DATA_END => open, DM => '0',
   CD_SL => cd_sl, CD_SR => cd_sr, AD_S => open, SLEEP => sleep,
+  WALK_SLEEP => walk,
   SaveStateBus_Din => ssb_din, SaveStateBus_Adr => ssb_adr,
   SaveStateBus_wren => ssb_wren, SaveStateBus_rst => '0',
   SaveStateBus_load => ssb_load, SaveStateBus_Dout => ssb_dout,
   SS_AD_Addr => (others => '0'), SS_AD_RdEn => '0', SS_AD_WrEn => '0',
   SS_AD_WrData => (others => '0'), SS_AD_RdData => open,
-  SS_CD_HOLD => open, SS_AUDIO_HOLD => ahold, CD_FAST_SEEK => fast
+  SS_CD_HOLD => open, SS_REPLAY_HOLD => ahold, CD_FAST_SEEK => fast
  );
 
  -- t_rise/t_fall and n_rise/n_fall are written on the clock after the edge

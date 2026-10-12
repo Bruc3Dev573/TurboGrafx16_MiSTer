@@ -5,7 +5,7 @@
 --     power_up_uninitialized=FALSE), read-during-write = new data.
 --     init_file is IGNORED (voltab/palette read as zeros — deterministic,
 --     which is all the determinism TB needs).
---   * scfifo/dcfifo: permanently-empty stubs (CD path unused, CD_EN=0).
+--   * scfifo/dcfifo_mixed_widths: functional showahead FIFO models.
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
@@ -154,16 +154,6 @@ end entity;
 
 architecture sim of scfifo is
 	-- functional ring buffer, showahead-ON semantics (q = head; rdreq pops)
-	--
-	-- Occupancy and both pointers are mirrored into signals so a testbench can
-	-- read them through an external name.  Inferring occupancy from rdreq and
-	-- the registered `empty` costs the observer the very cycle of ambiguity it
-	-- is trying to measure - and that ambiguity has been the root cause of
-	-- three separate defects in this project.  The mirrors are observation
-	-- only: nothing inside the model reads them.
-	signal dbg_cnt : integer := 0;
-	signal dbg_rp  : integer := 0;
-	signal dbg_wp  : integer := 0;
 begin
 	process(clock)
 		type mem_t is array (0 to lpm_numwords-1) of std_logic_vector(lpm_width-1 downto 0);
@@ -192,90 +182,10 @@ begin
 			if cnt = 0 then empty <= '1'; else empty <= '0'; end if;
 			if cnt >= lpm_numwords then full <= '1'; else full <= '0'; end if;
 			usedw <= std_logic_vector(to_unsigned(cnt mod 2**lpm_widthu, lpm_widthu));
-			dbg_cnt <= cnt;
-			dbg_rp  <= rp;
-			dbg_wp  <= wp;
 		end if;
 	end process;
 	almost_empty <= '0';
 	almost_full  <= '0';
-end architecture;
-
-library IEEE;
-use IEEE.std_logic_1164.all;
-
-entity dcfifo is
-	generic (
-		add_usedw_msb_bit       : string := "OFF";
-		clocks_are_synchronized : string := "FALSE";
-		delay_rdusedw           : natural := 1;
-		delay_wrusedw           : natural := 1;
-		intended_device_family  : string := "Cyclone V";
-		lpm_numwords            : natural := 0;
-		lpm_showahead           : string := "OFF";
-		lpm_type                : string := "dcfifo";
-		lpm_width               : natural := 1;
-		lpm_widthu              : natural := 1;
-		overflow_checking       : string := "ON";
-		rdsync_delaypipe        : natural := 0;
-		read_aclr_synch         : string := "OFF";
-		underflow_checking      : string := "ON";
-		use_eab                 : string := "ON";
-		write_aclr_synch        : string := "OFF";
-		wrsync_delaypipe        : natural := 0
-	);
-	port (
-		aclr    : in std_logic := '0';
-		data    : in std_logic_vector(lpm_width-1 downto 0);
-		q       : out std_logic_vector(lpm_width-1 downto 0);
-		rdclk   : in std_logic;
-		rdempty : out std_logic;
-		rdfull  : out std_logic;
-		rdreq   : in std_logic;
-		rdusedw : out std_logic_vector(lpm_widthu-1 downto 0);
-		wrclk   : in std_logic;
-		wrempty : out std_logic;
-		wrfull  : out std_logic;
-		wrreq   : in std_logic;
-		wrusedw : out std_logic_vector(lpm_widthu-1 downto 0)
-	);
-end entity;
-
-architecture sim of dcfifo is
-	-- functional model, single-clock assumption (rdclk = wrclk in this core)
-begin
-	process(wrclk)
-		type mem_t is array (0 to lpm_numwords-1) of std_logic_vector(lpm_width-1 downto 0);
-		variable mem : mem_t;
-		variable rp, wp, cnt : integer := 0;
-	begin
-		if rising_edge(wrclk) then
-			if aclr = '1' then
-				rp := 0; wp := 0; cnt := 0;
-			else
-				if wrreq = '1' and cnt < lpm_numwords then
-					mem(wp) := data;
-					wp := (wp + 1) mod lpm_numwords;
-					cnt := cnt + 1;
-				end if;
-				if rdreq = '1' and cnt > 0 then
-					rp := (rp + 1) mod lpm_numwords;
-					cnt := cnt - 1;
-				end if;
-			end if;
-			if cnt > 0 then
-				q <= mem(rp);
-			else
-				q <= (others => '0');
-			end if;
-			if cnt = 0 then rdempty <= '1'; else rdempty <= '0'; end if;
-			if cnt >= lpm_numwords then wrfull <= '1'; else wrfull <= '0'; end if;
-		end if;
-	end process;
-	rdfull  <= '0';
-	rdusedw <= (others => '0');
-	wrempty <= '0';
-	wrusedw <= (others => '0');
 end architecture;
 
 library IEEE;

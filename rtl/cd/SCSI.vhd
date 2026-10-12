@@ -65,16 +65,14 @@ entity SCSI is
 		REPLAY_CONSUMED	: out unsigned(31 downto 0) := (others => '0'); -- counter base before skip
 		CD_RESET_DONE		: in std_logic := '0';
 		REPLAY_RESET		: out std_logic := '0';
+		READ_HOLD           : out std_logic;
 		REPLAY_FAST			: out std_logic := '0';
 		-- Post-load audio hold: REPLAY_AUDIO is high from a load that restores
 		-- active CDDA until the replay flushes the stream that resumes it
 		-- (REPLAY_RESUME, a pulse coincident with that REPLAY_START) or
 		-- abandons the resume (pause, stop, abort).
 		REPLAY_AUDIO		: out std_logic := '0';
-		REPLAY_RESUME		: out std_logic := '0';
-		-- The staged DATAIN byte was already consumed by ADPCM DMA.
-		-- Latched by cd.vhd from the savestate on load.
-		DMA_STAGED			: in  std_logic := '0'
+		REPLAY_RESUME		: out std_logic := '0'
 	);
 end SCSI;
 
@@ -151,6 +149,7 @@ architecture rtl of SCSI is
 	signal D9_B2, D9_B3, D9_B4, D9_B5 : std_logic_vector(7 downto 0);
 	--READ6 replay
 	signal READ_ACTIVE   : std_logic;
+	signal READ_RESUME   : std_logic := '0';
 	-- a query command ($DD READ SUBQ, $DE CD_DINFO, ...) is outstanding
 	signal QRY_ACTIVE    : std_logic;
 	-- The HPS mailbox holds one command; wait for status before reusing it.
@@ -161,7 +160,6 @@ architecture rtl of SCSI is
 	signal SWALLOW       : unsigned(1 downto 0);	-- pending replay statuses to discard
 	signal RSKIP_GAP     : std_logic := '0';	-- idle cycle after a drain pop (EMPTY is registered)
 	signal SWAL_AGE      : unsigned(27 downto 0);	-- wait time for pending replay statuses
-	signal SEL_FLUSH     : std_logic := '0';	-- 1-CLK FIFO flush: game SEL while a replay drain was still pending
 	signal STAT_GET_D    : std_logic := '0';	-- edge detect: one status per strobe
 	type Replay_t is ( RP_IDLE, RP_WAIT, RP_CVT_START, RP_DIV588, RP_CVT_END, RP_LOOPMOD,
 	                   RP_HOLDGAP, RP_ISSUE, RP_GAP, RP_ISSUE_D9, RP_LF_CALC,
@@ -291,10 +289,10 @@ begin
 
 	
 	-- Flushed on load: it may hold bytes pushed by the pre-load stream during
-	-- the freeze.  SEL_FLUSH drops an abandoned replay drain's bytes.
+	-- the freeze.
 	FIFO : entity work.SCSI_FIFO 
 	port map(
-		aclr     => (not RESET_N) or SaveStateBus_load or RP_FIFO_HOLD or SEL_FLUSH or TAIL_FLUSH,
+		aclr     => (not RESET_N) or SaveStateBus_load or RP_FIFO_HOLD or TAIL_FLUSH,
 
 		wrclk		=> CLK,
 		data		=> FIFO_D,
@@ -320,6 +318,7 @@ begin
 			D9_B4 <= (others => '0');
 			D9_B5 <= (others => '0');
 			READ_ACTIVE <= '0';
+			READ_RESUME <= '0';
 			QRY_ACTIVE <= '0';
 			READ_CONSUMED <= (others => '0');
 			READ_SKIP <= (others => '0');
@@ -386,6 +385,12 @@ begin
 				AUDIO_ACTIVE <= SS_V(0)(58);
 				AUDIO_B1     <= SS_V(0)(22 downto 21);
 				READ_ACTIVE  <= SS_V(0)(23);
+				READ_RESUME  <= SS_V(0)(23);
+				if SS_V(0)(23) = '1' then
+					-- The reset/reissued READ supplies its own completion.
+					STAT_PEND <= '0';
+					STAT_COUNT <= (others => '0');
+				end if;
 				QRY_ACTIVE   <= SS_V(0)(59);
 				D9_B2   <= SS_V(5)(7 downto 0);
 				D9_B3   <= SS_V(5)(15 downto 8);
@@ -457,8 +462,11 @@ begin
 				AUD_AGE <= (others => '0');
 			end if;
 			STAT_GET_D <= STAT_GET;
-			if STAT_GET = '1' and STAT_GET_D = '0' and RP_PRIVATE = '0' then
-				READ_ACTIVE <= '0';	-- a status closes the in-flight READ
+			if RP = RP_IDLE and RP_FIFO_HOLD = '1' then
+				READ_RESUME <= '0'; -- replay aborted before issuing the READ
+			end if;
+			if STAT_GET = '1' and STAT_GET_D = '0' and RP_PRIVATE = '0'
+			   and not (READ_RESUME = '1' and RP /= RP_IDLE) then
 				if RP_TOC_READY = '0' or SWALLOW = 0 then
 					AUD_OPEN <= '0'; -- a swallowed D8 does not own the saved D9 debt
 				end if;
@@ -466,6 +474,12 @@ begin
 					SWALLOW <= SWALLOW - 1;
 					SWAL_AGE <= (others => '0');
 				else
+					if STATUS /= x"00" then
+						READ_ACTIVE <= '0';
+						READ_RESUME <= '0';
+						READ_SKIP <= (others => '0');
+						RSKIP_GAP <= '0';
+					end if;
 				STAT_PEND <= '1';
 			end if;
 			end if;
@@ -473,7 +487,8 @@ begin
 				SWALLOW <= SWALLOW + 1;
 			end if;
 			
-			if DOUT_REQ = '1' and RP_PRIVATE = '0' then
+			if DOUT_REQ = '1' and RP_PRIVATE = '0'
+			   and not (READ_RESUME = '1' and RP /= RP_IDLE) then
 				DOUT_PEND <= '1';
 			end if;
 			
@@ -483,7 +498,6 @@ begin
 			DATA_OUT <= '0';
 			CD_DATA_END <= '0';
 			AUDIO_CMD_SET <= '0';
-			SEL_FLUSH <= '0';
 			TAIL_FLUSH <= '0';
 			
 			if RST_N = '0' then
@@ -496,7 +510,8 @@ begin
 				if RP_RSKIP_SET = '1' then
 					READ_SKIP <= RP_RSKIP;
 					RSKIP_GAP <= '0';
-				elsif READ_SKIP /= 0 then
+				elsif READ_SKIP /= 0
+				   and not (STAT_GET = '1' and STAT_GET_D = '0' and STATUS /= x"00") then
 					-- Post-replay drain: discard the already-consumed head of the
 					-- re-issued stream. A seek delay must not cancel the byte debt.
 					-- EMPTY is registered: one idle cycle per pop (RSKIP_GAP) keeps
@@ -513,6 +528,8 @@ begin
 							TAIL_FLUSH <= '1';	-- RP_TAILDRAIN is cleared by its owner (replay process)
 						end if;
 					end if;
+				elsif RSKIP_GAP = '1' then
+					RSKIP_GAP <= '0';
 				elsif RP_FREEZE = '0' then
 				case SP is
 					when SP_FREE =>
@@ -520,14 +537,12 @@ begin
 							SAVED_RESPONSE <= '0';
 							-- a new command abandons the tracked READ stream
 							READ_ACTIVE <= '0';
+							READ_RESUME <= '0';
 							QRY_ACTIVE <= '0';
 							-- A game selection retires all replay bookkeeping: a leftover
 							-- swallow could only eat the game's own next status.
 							SWALLOW  <= (others => '0');
 							SWAL_AGE <= (others => '0');
-							if READ_SKIP /= 0 then
-								SEL_FLUSH <= '1';	-- drop the abandoned re-read's queued bytes
-							end if;
 							READ_SKIP    <= (others => '0');
 							RSKIP_GAP    <= '0';
 							BSY_Nr <= '0';
@@ -537,7 +552,7 @@ begin
 							SP <= SP_COMM_BEFOREREQ;
 							DELAY_COUNT <= to_unsigned(1700, DELAY_COUNT'LENGTH);		-- Wait 40 microseconds after control signals are set up, before triggering REQ in COMMAND phase
 							DATAIN_CNT <= (others => '0');
-						elsif STAT_PEND = '1' then
+						elsif STAT_PEND = '1' and (READ_ACTIVE = '0' or EMPTY = '1') then
 							STAT_COUNT <= STAT_COUNT + 1;
 
 							if (STAT_COUNT = 45000) then		-- CLK is 42.95 MHz; this gives ~1.05 millisec delay before transitioning to STATUS phase
@@ -545,6 +560,8 @@ begin
 																		-- the Sailor Moon hang issue
 								STAT_COUNT <= (others => '0');
 								STAT_PEND <= '0';
+								READ_ACTIVE <= '0';
+								READ_RESUME <= '0';
 								if SAVED_RESPONSE = '1' then
 									DBO_r <= SAVED_STATUS;
 								else
@@ -780,10 +797,18 @@ begin
 	
 	-- Only the CPU-visible "data ready" is masked, never REQ_N itself: an ACK
 	-- caught in flight must still complete once the FSM resumes.
-	DATAIN_HOLD <= '1' when (RP_FREEZE = '1' or READ_SKIP /= 0)
-	                    and (SP = SP_DATAIN_START or SP = SP_DATAIN_END)
+	DATAIN_HOLD <= '1' when ((RP_FREEZE = '1' or RP_RSKIP_SET = '1'
+	                        or READ_SKIP /= 0 or RSKIP_GAP = '1')
+	                    and (SP = SP_DATAIN_START or SP = SP_DATAIN_END))
+	                    or (READ_ACTIVE = '1'
+	                        and SP = SP_FREE and (STAT_PEND = '0' or EMPTY = '0'))
 	               else '0';
 	DATAIN_HELD <= DATAIN_HOLD;
+	-- Rebuild the stream with emulated time stopped; later sector gaps only
+	-- stall the CPU, leaving video, timers and audio on their normal cadence.
+	READ_HOLD <= '1' when READ_RESUME = '1'
+	                  and (RP_FREEZE = '1' or RP_RSKIP_SET = '1'
+	                       or READ_SKIP /= 0 or RSKIP_GAP = '1') else '0';
 
 	COMMAND <= RP_COMM when RP_COMM_OVR = '1' else
 	           COMM(11) & COMM(10) & COMM(9) & COMM(8) & COMM(7) & COMM(6) & COMM(5) & COMM(4) & COMM(3) & COMM(2) & COMM(1) & COMM(0);
@@ -934,8 +959,7 @@ begin
 					end if;
 
 				when RP_WAIT =>
-					-- Latch CDDA_CONSUMED a few cycles in: the stale pre-load FIFO
-					-- tail is still playing and would inflate it by the settle time.
+					-- Capture the restored CDDA_CONSUMED latch after the load edge.
 					if RP_DELAY = RP_T_SETTLE - 32 then
 						RP_CONS <= CDDA_CONSUMED;
 					end if;
@@ -949,7 +973,9 @@ begin
 								RP <= RP_CVT_START;
 							end if;
 						elsif READ_ACTIVE = '1' then
-							RP <= RP_RD_PREP;
+							REPLAY_RESET <= '1';
+							RP_STWD <= (others => '0');
+							RP <= RP_RESET_WAIT;
 						else
 							RP_SKIP <= (others => '0');	-- pause path: flush only, no drain
 							RP_DELAY <= RP_T_GAP;
@@ -963,8 +989,12 @@ begin
 				when RP_RESET_WAIT =>
 					if CD_RESET_DONE = '1' then
 						RP_STWD <= (others => '0');
-						RP_TOC_KIND <= 0;
-						RP <= RP_TOC_ISSUE;
+						if READ_ACTIVE = '1' then
+							RP <= RP_RD_PREP;
+						else
+							RP_TOC_KIND <= 0;
+							RP <= RP_TOC_ISSUE;
+						end if;
 					end if;
 
 				when RP_TOC_ISSUE =>
@@ -1284,11 +1314,7 @@ begin
 					-- nxt_v is one past the last byte already held by the consumer.
 					-- Keep the restored DBO byte; drain its replayed copy.
 					if SP = SP_DATAIN_START or SP = SP_DATAIN_END then
-						if DMA_STAGED = '1' then	-- the DMA already stored the staged byte
-							nxt_v := READ_CONSUMED + 2;
-						else
-							nxt_v := READ_CONSUMED + 1;
-						end if;
+						nxt_v := READ_CONSUMED + 1;
 					else
 						nxt_v := READ_CONSUMED;
 					end if;
@@ -1396,7 +1422,7 @@ begin
 			end if;
 		end if;
 	end process;
-	
+
 	-- Held until the replay's statuses have been swallowed too: statuses carry
 	-- no identity, so a game command issued meanwhile would lose its own.
 	RP_FREEZE <= '0' when RP = RP_IDLE and SWALLOW = 0 else '1';

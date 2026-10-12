@@ -9,9 +9,6 @@
 -- without the slow CD-streaming scenarios in front of it — it answers the
 -- hardware "wipe BRAM -> loads break" report directly.
 --
--- If this PASSES, the pce_top-side region-7 walk is correct and the hardware
--- bug is in the SV top (dpram_difclk / bk_loading / defbram).  If it FAILS,
--- the bug is in pce_top and is fixed here.
 -- Run: sim/run_tb_brm.sh
 -----------------------------------------------------------------------------
 library IEEE;

@@ -102,40 +102,4 @@ package altera_mf_components is
 	);
 	end component;
 
-	component dcfifo
-	generic (
-		add_usedw_msb_bit       : string := "OFF";
-		clocks_are_synchronized : string := "FALSE";
-		delay_rdusedw           : natural := 1;
-		delay_wrusedw           : natural := 1;
-		intended_device_family  : string := "Cyclone V";
-		lpm_numwords            : natural := 0;
-		lpm_showahead           : string := "OFF";
-		lpm_type                : string := "dcfifo";
-		lpm_width               : natural := 1;
-		lpm_widthu              : natural := 1;
-		overflow_checking       : string := "ON";
-		rdsync_delaypipe        : natural := 0;
-		read_aclr_synch         : string := "OFF";
-		underflow_checking      : string := "ON";
-		use_eab                 : string := "ON";
-		write_aclr_synch        : string := "OFF";
-		wrsync_delaypipe        : natural := 0
-	);
-	port (
-		aclr    : in std_logic := '0';
-		data    : in std_logic_vector(lpm_width-1 downto 0);
-		q       : out std_logic_vector(lpm_width-1 downto 0);
-		rdclk   : in std_logic;
-		rdempty : out std_logic;
-		rdfull  : out std_logic;
-		rdreq   : in std_logic;
-		rdusedw : out std_logic_vector(lpm_widthu-1 downto 0);
-		wrclk   : in std_logic;
-		wrempty : out std_logic;
-		wrfull  : out std_logic;
-		wrreq   : in std_logic;
-		wrusedw : out std_logic_vector(lpm_widthu-1 downto 0)
-	);
-	end component;
 end package;

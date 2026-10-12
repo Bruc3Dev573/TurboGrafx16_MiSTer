@@ -83,11 +83,8 @@ architecture rtl of MSM5205 is
 	constant SIT : StepIndexTable_t := ("0010","0100","0110","1000");
 	
 	 
-	-- CLK_CNT is never cleared by RST_N (only wrapped at 48), so without an
-	-- initial value it stays 'U' for the whole simulation: the VCK pulses never
-	-- fire and the decoder looks dead in a testbench even though it runs on real
-	-- hardware (FPGA registers power up at 0).  Initialising it makes simulation
-	-- match the device and is what Quartus infers anyway.
+	-- RST_N does not clear CLK_CNT; initialize it to match FPGA power-up
+	-- and avoid an unknown divider that prevents VCK pulses in simulation.
 	signal CLK_CNT    : unsigned(5 downto 0) := (others => '0');
 	signal SAMPLE_RCE : std_logic := '0';
 	signal SAMPLE_FCE : std_logic := '0';
@@ -155,13 +152,13 @@ begin
 				else
 					NEXT_SAMPLE := SAMPLE + DELTA;
 				end if;
-				
+
 				if NEXT_SAMPLE(12 downto 11) = "01" then
 					NEXT_SAMPLE := x"07FF";
 				elsif NEXT_SAMPLE(12 downto 11) = "10" then
 					NEXT_SAMPLE := x"F800";
 				end if;
-				
+
 				SAMPLE <= NEXT_SAMPLE;
 
 				if DEC_DATA(2) = '1' then

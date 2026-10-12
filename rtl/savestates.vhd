@@ -20,19 +20,19 @@ entity savestates is
       -- in sim-minutes (STATESIZE is derived, everything adapts)
       CDRAM_BYTES : integer := 262144
    );
-   port 
+   port
    (
-      clk                     : in     std_logic;  
+      clk                     : in     std_logic;
       reset_in                : in     std_logic;
       reset_ss                : out    std_logic := '0';
       reset_delay             : out    std_logic := '0';
-            
+
       load_done               : out    std_logic := '0';
       arcade_used             : in     std_logic := '0';
       arcade_loaded           : out    std_logic := '0';
-            
+
       increaseSSHeaderCount   : in     std_logic;
-      save                    : in     std_logic;  
+      save                    : in     std_logic;
       save_abort              : in     std_logic := '0';	-- suppress control word; cleared header stays invalid
       inhibit                 : in     std_logic := '0'; -- reject only before save/load commits
       load                    : in     std_logic;
@@ -41,19 +41,19 @@ entity savestates is
       -- Suppress UI completion for a failed save or a load cancelled before
       -- restoring anything. Held until the next accepted request.
       save_failed             : out    std_logic := '0';
-      
+
       paused                  : in     std_logic;
-            
+
       BUS_Din                 : out    std_logic_vector(BUS_buswidth-1 downto 0) := (others => '0');
       BUS_Adr                 : buffer std_logic_vector(BUS_busadr-1 downto 0) := (others => '0');
       BUS_wren                : out    std_logic := '0';
       BUS_rst                 : out    std_logic := '0';
       BUS_Dout                : in     std_logic_vector(BUS_buswidth-1 downto 0) := (others => '0');
-            
+
       loading_savestate       : out    std_logic := '0';
       saving_savestate        : out    std_logic := '0';
       sleep_savestate         : out    std_logic := '0';
-            
+
       Save_RAMAddr            : buffer std_logic_vector(24 downto 0) := (others => '0');
       Save_RAMRdEn            : out    std_logic := '0';
       Save_RAMWrEn            : out    std_logic := '0';
@@ -61,7 +61,7 @@ entity savestates is
       Save_RAMReadData        : in     std_logic_vector(7 downto 0);
       Save_RAMRdy             : in     std_logic := '1';  -- slow regions (SDRAM) pace the walk
       Save_RAMType            : out    unsigned(3 downto 0);  -- PCE: 12 regions
-      
+
       bus_out_Din             : out    std_logic_vector(63 downto 0) := (others => '0');
       bus_out_Dout            : in     std_logic_vector(63 downto 0);
       bus_out_Adr             : buffer std_logic_vector(25 downto 0) := (others => '0');
@@ -142,23 +142,23 @@ architecture arch of savestates is
       LOADMEMORY_WRITE
    );
    signal state : tstate := IDLE;
-   
+
    signal count               : integer range 0 to MAXSIZEMEM := 0;
    signal maxcount            : integer range 0 to MAXSIZEMEM;
-               
+
    signal settle              : integer range 0 to SETTLECOUNT := 0;
-   
+
    signal bytecounter         : integer range 0 to 7 := 0;
    signal RAMAddrNext         : std_logic_vector(24 downto 0) := (others => '0');
    signal memory_slow         : unsigned(2 downto 0) := (others => '0');
-   
+
    signal header_amount       : unsigned(31 downto 0) := to_unsigned(1, 32);
    -- Header byte enables. With increaseSSHeaderCount = '0' header writes skip
    -- the change counter (low word): Main copies a slot to SD only when that
    -- counter changes, so the slot stays in memory.
    signal hdr_be              : std_logic_vector(7 downto 0);
 
-begin 
+begin
 
    savestate_busy <= '0' when state = IDLE else '1';
    arcade_loaded <= transaction_arcade;
@@ -167,7 +167,7 @@ begin
    process (clk)
    begin
       if rising_edge(clk) then
-   
+
          bus_out_ena   <= '0';
          BUS_wren      <= '0';
          BUS_rst       <= '0';
@@ -176,15 +176,15 @@ begin
          load_done     <= '0';
 
          bus_out_be    <= x"FF";
-         
+
          memory_slow <= memory_slow + 1;
          if (memory_slow = 6) then
             Save_RAMRdEn  <= '0';
             Save_RAMWrEn  <= '0';
          end if;
-   
+
          case state is
-         
+
             when IDLE =>
                savetype_counter <= 0;
                -- No RAM region owns the port during settle/header transfers.
@@ -206,11 +206,11 @@ begin
                   -- Each accepted operation replaces the previous result.
                   save_failed          <= '0';
                end if;
-               
+
             -- #################
             -- SAVE
             -- #################
-            
+
             when SAVE_WAITSETTLE =>
                if (inhibit = '1') then
                   state           <= IDLE;
@@ -263,26 +263,26 @@ begin
                if (bus_out_done = '1') then
                   state       <= SAVEINTERNALS_WAIT;
                   bus_out_Adr <= std_logic_vector(to_unsigned(savestate_address + HEADERCOUNT, 26));
-               end if;            
-            
+               end if;
+
             when SAVEINTERNALS_WAIT =>
                bus_out_Din    <= BUS_Dout;
                bus_out_ena    <= '1';
                state          <= SAVEINTERNALS_WRITE;
-            
-            when SAVEINTERNALS_WRITE => 
+
+            when SAVEINTERNALS_WRITE =>
                if (bus_out_done = '1') then
                   bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
                   if (count < INTERNALSCOUNT) then
                      state       <= SAVEINTERNALS_WAIT;
                      count       <= count + 1;
                      BUS_adr     <= std_logic_vector(unsigned(BUS_adr) + 1);
-                  else 
+                  else
                      state       <= SAVEMEMORY_NEXT;
                      count       <= 8;
                   end if;
                end if;
-            
+
             when SAVEMEMORY_NEXT =>
                if (savetype_counter < ARCADE_SAVETYPE or
                    (savetype_counter = ARCADE_SAVETYPE and transaction_arcade = '1')) then
@@ -311,7 +311,7 @@ begin
                   end if;
                   bus_out_be <= hdr_be;
                end if;
-            
+
             when SAVEMEMORY_READ =>
                if (memory_slow = 7 and Save_RAMRdy = '1') then
                   bus_out_Din(bytecounter * 8 + 7 downto bytecounter * 8) <= Save_RAMReadData;
@@ -324,7 +324,7 @@ begin
                      bus_out_ena    <= '1';
                   end if;
                end if;
-               
+
             when SAVEMEMORY_WRITE =>
                if (bus_out_done = '1') then
                   bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
@@ -335,12 +335,12 @@ begin
                      Save_RAMAddr <= std_logic_vector(unsigned(Save_RAMAddr) + 1);
                      Save_RAMRdEn <= '1';
                      memory_slow  <= (others => '0');
-                  else 
+                  else
                      savetype_counter <= savetype_counter + 1;
                      state            <= SAVEMEMORY_NEXT;
                   end if;
                end if;
-            
+
             when SAVESIZEAMOUNT =>
                bus_out_be <= hdr_be;
                if (bus_out_done = '1' or save_abort = '1') then
@@ -348,12 +348,12 @@ begin
                   saving_savestate <= '0';
                   sleep_savestate  <= '0';
                end if;
-            
-            
+
+
             -- #################
             -- LOAD
             -- #################
-            
+
             when LOAD_WAITSETTLE =>
                if (inhibit = '1') then
                   state           <= IDLE;
@@ -369,7 +369,7 @@ begin
                   bus_out_rnw          <= '1';
                   bus_out_ena          <= '1';
                end if;
-               
+
             when LOAD_HEADERAMOUNTCHECK =>
                if (bus_out_done = '1') then
                   -- Header acceptance commits the restore; never interrupt it afterward.
@@ -398,22 +398,22 @@ begin
                      save_failed          <= '1';
                   end if;
                end if;
-            
+
             when LOADINTERNALS_READ =>
                if (bus_out_done = '1') then
                   state           <= LOADINTERNALS_WRITE;
                   BUS_Din         <= bus_out_Dout;
                   BUS_wren        <= '1';
                end if;
-            
-            when LOADINTERNALS_WRITE => 
+
+            when LOADINTERNALS_WRITE =>
                bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
                if (count < INTERNALSCOUNT) then
                   state          <= LOADINTERNALS_READ;
                   count          <= count + 1;
                   bus_out_ena    <= '1';
                   BUS_adr        <= std_logic_vector(unsigned(BUS_adr) + 1);
-               else 
+               else
                   state          <= LOADMEMORY_RESET;
                end if;
 
@@ -421,7 +421,7 @@ begin
                reset_ss  <= '1';
                state     <= LOADMEMORY_NEXT;
                count     <= 8;
-            
+
             when LOADMEMORY_NEXT =>
                -- Drain the final paced write before switching region or waking.
                if (memory_slow = 7 and Save_RAMRdy = '1') then
@@ -441,12 +441,12 @@ begin
                      load_done         <= '1';
                   end if;
                end if;
-            
+
             when LOADMEMORY_READ =>
                if (bus_out_done = '1') then
                   state             <= LOADMEMORY_WRITE;
                end if;
-               
+
             when LOADMEMORY_WRITE =>
                if (memory_slow = 7 and Save_RAMRdy = '1') then
                   RAMAddrNext                    <= std_logic_vector(unsigned(RAMAddrNext) + 1);
@@ -463,22 +463,17 @@ begin
                         count          <= count + 8;
                         bytecounter    <= 0;
                         bus_out_ena    <= '1';
-                     else 
+                     else
                         savetype_counter <= savetype_counter + 1;
                         state            <= LOADMEMORY_NEXT;
                      end if;
                   end if;
                end if;
-         
+
          end case;
-         
+
       end if;
    end process;
-   
+
 
 end architecture;
-
-
-
-
-

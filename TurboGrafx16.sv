@@ -315,7 +315,6 @@ wire [63:0] sse_din, sse_dout_ext;
 wire  [9:0] sse_adr;
 wire        sse_wren, sse_rst, sse_load;
 wire [63:0] ss_top_ext;
-wire        ss_ac_used;	// game actually touched the Arcade Card
 
 reg rom_loaded = 0;
 always @(posedge clk_sys) if (cart_download) rom_loaded <= 1;
@@ -389,9 +388,6 @@ wire        ce_rom;
 
 wire [15:0] cdda_sl, cdda_sr, adpcm_s, psg_sl, psg_sr;
 
-// Named association: pce_top's first generic is SS_CDRAM_BYTES, not LITE.
-// Positional #(LITE) would set it to 0 and drop the CD work RAM from the
-// savestate.
 pce_top #(.LITE(LITE)) pce_top
 (
 	.RESET(reset|cart_download),
@@ -423,7 +419,7 @@ pce_top #(.LITE(LITE)) pce_top
 	.SSE_rst(sse_rst),
 	.SSE_load(sse_load),
 	.SSE_Dout(sse_dout_ext),
-	.SS_AC_USED(ss_ac_used),
+	.SS_AC_USED(),
 
 	.ROM_RD(rom_rd),
 	.ROM_RDY(rom_sdrdy & rom_ddrdy & ram_ddrdy),
@@ -1262,11 +1258,8 @@ MB128 MB128
 reg bk_pending;
 
 always @(posedge clk_sys) begin
-	// ~ss_sleep: a LOAD rewrites the backup RAM through the CPU's own BRM port,
-	// so without this the restore looks like the game saving and the next
-	// autosave writes the ROLLED-BACK contents over the player's .sav.  The
-	// upstream cores do not have this edge (NES_MiSTer marks the file dirty from
-	// the cart's own write strobe, not from its savestate walk).
+	// Restore writes must not mark backup RAM dirty: the next autosave would
+	// otherwise overwrite the player's .sav with the restored contents.
 	if (bk_ena && ~OSD_STATUS && ((bram_wr && ~ss_sleep) || mb128_dirty))
 		bk_pending <= 1'b1;
 	else if (bk_state)

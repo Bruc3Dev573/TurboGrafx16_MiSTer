@@ -1,5 +1,5 @@
 #!/bin/bash
-# Real Arcade SV + the production VHDL eRegs. Run with hdlc/sim:osvb.
+# Real Arcade SV + the production VHDL eRegs.
 set -euo pipefail
 for tool in ghdl verilator timeout; do
     command -v "$tool" >/dev/null || { echo "$tool not found" >&2; exit 1; }

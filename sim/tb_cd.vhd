@@ -37,6 +37,9 @@ entity tb_cd is
 		-- earlier.  ghdl -gG_READS=0 -gG_DO_A=false gives the fast music+BRAM
 		-- run; the defaults give the full matrix.
 		G_READS : integer := 3;
+		-- Opt-in real-CPU READ6 -> VDC copy (sim/run_tb_cd_blind.sh).
+		-- Only sector starts poll readiness; the byte-copy loop is blind.
+		G_BLIND_READ : boolean := false;
 		G_DO_A  : boolean := true;
 		-- SAPEP mode (D9 byte1): 1 = LOOP, 2 = INTERRUPT. INTERRUPT replies
 		-- at track end, leaving BSY set with SP_FREE while audio plays.
@@ -193,6 +196,18 @@ architecture sim of tb_cd is
 	constant H_NIB_TOTAL : integer := H_SECT_N * 2048 * 2;
 	constant H_TRIG      : integer := (H_NIB_TOTAL * 3) / 10;
 
+	-- The blind reader stores three sectors, then a fresh two-sector READ,
+	-- at VRAM byte $4000. Distinct LBA/16-byte/256-byte blocks expose repeats.
+	constant BLIND_VRAM_BYTE : integer := 16#4000#;
+	constant BLIND_BYTES : integer := 5 * 2048;
+	function blind_byte(lba, offset : integer) return std_logic_vector is
+	begin
+		return std_logic_vector(to_unsigned(
+			(lba * 37 + (lba / 256) * 11 + offset * 17
+			 + (offset / 256) * 29 + (offset / 16) * 7) mod 256, 8));
+	end function;
+	signal blind_early_status : integer := 0;
+
 	signal clk      : std_logic := '0';
 	signal reset    : std_logic := '1';
 
@@ -228,6 +243,8 @@ architecture sim of tb_cd is
 	signal cd_comm     : std_logic_vector(95 downto 0);
 	signal cd_comm_send: std_logic;
 	signal cd_fast_seek: std_logic;
+	signal cd_reset    : std_logic;
+	signal cd_reset_done : std_logic := '0';
 	signal cd_data     : std_logic_vector(7 downto 0) := (others => '0');
 	signal cd_data_wr  : std_logic := '0';
 	signal cd_audio_wr : std_logic := '0';
@@ -304,8 +321,12 @@ architecture sim of tb_cd is
 		-- $FF20: N verified READs, then D8+D9, then the counter loop.
 		-- Repeated reads keep scenario A inside a transfer, then check
 		-- alignment across subsequent command boundaries.
-		b(16#A9#); b(G_READS);                        -- LDA #G_READS
-		b(16#8D#); b(16#16#); b(16#20#);              -- STA $2016
+		if G_BLIND_READ then
+			b(16#4C#); b(16#00#); b(16#F0#); b(16#EA#); b(16#EA#); -- JMP $F000
+		else
+			b(16#A9#); b(G_READS);                    -- LDA #G_READS
+			b(16#8D#); b(16#16#); b(16#20#);          -- STA $2016
+		end if;
 		-- With G_READS = 0 the JSR and the BNE are replaced by NOPs of the SAME
 		-- length rather than omitted, so every address below (the JSR $FF52
 		-- calls, the main loop, SEND_CMD) stays exactly where it is.
@@ -1091,6 +1112,108 @@ architecture sim of tb_cd is
 		b(16#58#);
 		b(16#60#); -- $F8F9 RTS
 		chk(16#18FA#);
+
+		if G_BLIND_READ then
+			-- Reuse the same ROM assembler, CPU mappings and VDC setup.
+			-- $2040 counts fully closed READs; $2041 ORs STATUS/MSGIN bytes.
+			org(16#1000#);                           -- $F000
+			b(16#78#); b(16#D4#);                    -- SEI / CSH (real fast CPU cadence)
+			b(16#9C#); b(16#40#); b(16#20#);          -- STZ $2040
+			b(16#9C#); b(16#41#); b(16#20#);          -- STZ $2041
+			b(16#9C#); b(16#00#); b(16#40#);          -- AR=MAWR
+			b(16#9C#); b(16#02#); b(16#40#);          -- MAWR lo=0
+			b(16#A9#); b(16#20#);                    -- MAWR hi=$20
+			b(16#8D#); b(16#03#); b(16#40#);
+			b(16#A9#); b(16#02#);                    -- AR=VWR
+			b(16#8D#); b(16#00#); b(16#40#);
+			b(16#A2#); b(16#E0#);                    -- READ6 $FFE0: LBA $400, 3 sectors
+			b(16#20#); b(16#00#); b(16#F1#);
+			b(16#20#); b(16#50#); b(16#F1#);          -- wait DATAIN once at sector start
+			b(16#A2#); b(16#0A#); b(16#A0#); b(1);    -- first 10 words (20 bytes)
+			b(16#20#); b(16#80#); b(16#F1#);
+			b(16#AD#); b(16#08#); b(16#58#);          -- byte 20 -> pending VWR low byte
+			b(16#8D#); b(16#02#); b(16#40#);
+			b(16#20#); b(16#D5#); b(16#F8#);          -- existing CPU busy wait, save at offset 21
+			b(16#AD#); b(16#08#); b(16#58#);          -- byte 21 -> VWR high, commits word
+			b(16#8D#); b(16#03#); b(16#40#);
+			b(16#A2#); b(16#F5#); b(16#A0#); b(4);    -- remaining 1013 words of sector 0
+			b(16#20#); b(16#80#); b(16#F1#);
+			for sector in 1 to 2 loop
+				b(16#20#); b(16#50#); b(16#F1#);      -- one readiness poll per sector
+				b(16#A2#); b(0); b(16#A0#); b(4);     -- exactly 1024 words
+				b(16#20#); b(16#80#); b(16#F1#);
+			end loop;
+			b(16#20#); b(16#A0#); b(16#F1#);          -- close STATUS/MSGIN and bus
+			b(16#A2#); b(16#DA#);                    -- fresh READ6 $FFDA: LBA $900, 2 sectors
+			b(16#20#); b(16#00#); b(16#F1#);
+			for sector in 1 to 2 loop
+				b(16#20#); b(16#50#); b(16#F1#);
+				b(16#A2#); b(0); b(16#A0#); b(4);
+				b(16#20#); b(16#80#); b(16#F1#);
+			end loop;
+			b(16#20#); b(16#A0#); b(16#F1#);
+			b(16#4C#); b(16#E0#); b(16#F0#);          -- park only after both READs close
+			chk(16#1073#);
+			org(16#10E0#);
+			b(16#4C#); b(16#E0#); b(16#F0#);
+
+			-- Command-only half of the existing READ6 handshake; X is table offset.
+			org(16#1100#);                           -- $F100
+			b(16#AD#); b(16#00#); b(16#58#);
+			b(16#29#); b(16#80#); b(16#D0#); b(16#F9#); -- wait bus free
+			b(16#A9#); b(16#81#);
+			b(16#8D#); b(16#01#); b(16#58#);
+			b(16#8D#); b(16#00#); b(16#58#);
+			b(16#AD#); b(16#00#); b(16#58#);
+			b(16#29#); b(16#80#); b(16#F0#); b(16#F1#); -- retry SEL
+			b(16#A0#); b(6);
+			b(16#AD#); b(16#00#); b(16#58#);
+			b(16#29#); b(16#40#); b(16#F0#); b(16#F9#);
+			b(16#BD#); b(16#00#); b(16#FF#);
+			b(16#8D#); b(16#01#); b(16#58#);
+			b(16#A9#); b(16#80#);
+			b(16#8D#); b(16#02#); b(16#58#);
+			b(16#AD#); b(16#00#); b(16#58#);
+			b(16#29#); b(16#40#); b(16#D0#); b(16#F9#);
+			b(16#9C#); b(16#02#); b(16#58#);
+			b(16#E8#); b(16#88#); b(16#D0#); b(16#E0#);
+			b(16#60#);
+			chk(16#1139#);
+
+			org(16#1150#);                           -- $F150: sector-start DATAIN poll
+			b(16#AD#); b(16#00#); b(16#58#);
+			b(16#29#); b(16#78#); b(16#C9#); b(16#48#);
+			b(16#D0#); b(16#F7#); b(16#60#);
+
+			org(16#1180#);                           -- $F180: BIOS-style blind word copy
+			b(16#AD#); b(16#08#); b(16#58#);          -- LDA $5808
+			b(16#8D#); b(16#02#); b(16#40#);          -- STA VDC low
+			b(16#AD#); b(16#08#); b(16#58#);
+			b(16#8D#); b(16#03#); b(16#40#);          -- STA VDC high
+			b(16#CA#); b(16#D0#); b(16#F1#);          -- DEX / BNE word loop
+			b(16#88#); b(16#D0#); b(16#EE#);          -- DEY / BNE next 256 words
+			b(16#60#);
+			chk(16#1193#);
+
+			org(16#11A0#);                           -- $F1A0: require GOOD + zero MSGIN
+			for phase in 0 to 1 loop
+				b(16#AD#); b(16#00#); b(16#58#);
+				b(16#29#); b(16#78#);
+				b(16#C9#); b(16#58# + phase * 16#20#); -- STATUS then MSGIN, REQ asserted
+				b(16#D0#); b(16#F7#);
+				b(16#AD#); b(16#01#); b(16#58#);
+				b(16#0D#); b(16#41#); b(16#20#);      -- ORA $2041
+				b(16#8D#); b(16#41#); b(16#20#);
+				b(16#20#); b(16#E0#); b(16#F8#);      -- existing manual ACK helper
+			end loop;
+			b(16#AD#); b(16#00#); b(16#58#);
+			b(16#29#); b(16#80#); b(16#D0#); b(16#F9#);
+			b(16#EE#); b(16#40#); b(16#20#);
+			b(16#60#);
+			chk(16#11D5#);
+			r(16#1FE4#) := x"03";
+			r(16#1FDE#) := x"02";
+		end if;
 		return r;
 	end function;
 	constant ROM : rom_t := rom_init;
@@ -1130,7 +1253,6 @@ architecture sim of tb_cd is
 	-- overflow a nearly full FIFO, and the monitor reports it.
 	signal frz_cdda_drop : integer := 0;	-- CDDA samples lost while frozen
 	signal frz_subc_drop : integer := 0;	-- subcode bytes lost while frozen
-	signal frz_cdda_hi   : integer := 0;	-- peak CDDA FIFO backlog entering a freeze
 
 	-- Sample-tape index at the last CDDA flush. Anchor B/G to a flush:
 	-- a looping track eventually reaches any value, even after a bad resume.
@@ -1193,11 +1315,11 @@ architecture sim of tb_cd is
 	signal w_frz_slot    : std_logic := '0';
 	signal w_frz_audopen : std_logic := '0';
 
-	-- scenario H (ADPCM DMA) verdict signals, raised by h_mon
+	-- scenario H (ADPCM DMA) monitor signals, raised by h_mon
 	signal h_arm    : std_logic := '0';	-- watch the ADPCM RAM write port
 	signal h_clr    : std_logic := '0';	-- forget everything seen so far
 	signal h_nib    : integer := 0;		-- nibble writes seen (2 per DMA byte)
-	signal h_cov    : integer := 0;		-- DISTINCT nibble addresses written
+	signal h_cov    : integer := 0;		-- DISTINCT nibble addresses written (reporting only)
 	signal h_after  : integer := 0;		-- nibble writes seen after the load
 	signal h_mark   : std_logic := '0';	-- set by the stim right after the load
 	signal h_fail   : std_logic := '0';	-- a byte landed with the wrong value
@@ -1213,6 +1335,7 @@ architecture sim of tb_cd is
 	signal mbox_comm  : std_logic_vector(95 downto 0) := (others => '0');
 	signal mbox_count : integer := 0;
 	signal mbox_fast  : std_logic := '0';	-- its fast-seek bit (cd_in[111] in TurboGrafx16.sv)
+	signal cd_reset_count : integer := 0;
 
 	-- Count one-cycle CD_DATA_END pulses so the polling drive model can
 	-- observe consumption between its wakeups.
@@ -1270,7 +1393,8 @@ begin
 		CD_DOUT     => open,
 		CD_DOUT_SEND=> open,
 		CD_REGION   => '0',
-		CD_RESET    => open,
+		CD_RESET    => cd_reset,
+		CD_RESET_DONE => cd_reset_done,
 		CD_FAST_SEEK=> cd_fast_seek,
 		CD_DATA     => cd_data,
 		CD_DATA_WR  => cd_data_wr,
@@ -1370,6 +1494,7 @@ begin
 
 	mbox : process(clk)
 		variable prev : std_logic := '0';
+		variable prev_reset : std_logic := '0';
 	begin
 		if rising_edge(clk) then
 			if cd_comm_send = '1' and prev = '0' then
@@ -1377,6 +1502,10 @@ begin
 				mbox_count <= mbox_count + 1;
 				mbox_fast  <= cd_fast_seek;
 			end if;
+			if cd_reset = '1' and prev_reset = '0' then
+				cd_reset_count <= cd_reset_count + 1;
+			end if;
+			prev_reset := cd_reset;
 			prev := cd_comm_send;
 		end if;
 	end process;
@@ -1442,6 +1571,7 @@ begin
 		variable rh_sect_cnt : integer := 0;		-- 16 ms / 50 us; 0 = may push now
 		variable skms        : integer := 0;
 		variable seen      : integer := 0;
+		variable seen_reset : integer := 0;
 		variable rdcnt     : integer := 0;
 		variable seen_end  : integer := 0;
 		-- Consumption-gated mode sends sector k after k*2048 bytes are consumed,
@@ -1482,11 +1612,37 @@ begin
 		loop
 			-- react quickly to commands; otherwise advance to the next tick
 			wait until mbox_count /= seen or cd_end_count /= seen_end
-			              or now >= t_next for 50 us;
+			              or cd_reset_count /= seen_reset or now >= t_next for 50 us;
+
+			if cd_reset_count /= seen_reset then
+				-- Acknowledge only after the blocking burst has finished and all
+				-- old drive work is cancelled, matching Main's synchronous Reset.
+				seen_reset := cd_reset_count;
+				seen := mbox_count;
+				seen_end := cd_end_count;
+				state := H_IDLE;
+				lba := 0; pstart := 0; pend_lba := 100000; mode := 0;
+				int_pend := false;
+				pend_stat := false; stat_wait := 0;
+				rd_stat := false; rd_wait := 0;
+				rdcnt := 0; pushed := 0; total := 0; removed := 0;
+				dd_pend := false; dd_stat := false; dd_wait := 0;
+				rh_has := false; rh_lat := 0; rh_can := false;
+				rh_sect_cnt := 0; rh_stat_cnt := 267;
+				audio_next := now; play_lat := 0 ns; audio_burst := 2;
+				hps_slot <= '0'; hps_dd_pend <= '0';
+				cd_stat_get <= '0';
+				cd_data_wr <= '0'; cd_audio_wr <= '0'; cd_subcd_wr <= '0';
+				wait until rising_edge(clk);
+				cd_reset_done <= '1';
+				wait until rising_edge(clk);
+				wait until rising_edge(clk);
+				cd_reset_done <= '0';
+				t_next := now + 50 us;
+			end if;
 
 			if mbox_count /= seen then
 				seen := mbox_count;
-				if true then
 				wait for 50 * CLK_PERIOD;			-- ~mailbox pickup delay
 				comm := mbox_comm;
 				fast := mbox_fast;
@@ -1527,6 +1683,13 @@ begin
 					pushed := 0;
 					total  := rdcnt * 2048;
 					state := H_READ;
+					if G_BLIND_READ then
+						-- Main primes can_read_next at READ6 issue. The host does
+						-- not see a savestate load; only CD_RESET/mailbox events.
+						rh_can := true;
+						rh_sect_cnt := 2;
+						seen_end := cd_end_count;
+					end if;
 					-- The consumption-gated model has no seek latency: start
 					-- its first sector relative to this command, not an unrelated
 					-- polling tick left over from the previous transaction.
@@ -1619,12 +1782,12 @@ begin
 					hps_dd_pend <= '1';
 					report "HPS: DD subq, latency " & integer'image(dd_wait) & " ticks";
 				end if;
-				end if;	-- rising edge
 			end if;
 
-			-- CD_DATA_END only wakes the model promptly; whether to stream the
-			-- next sector is decided from READ_CONSUMED below.
+			-- Blind mode uses the real mailbox sector-consumed event, never
+			-- READ_CONSUMED/READ_SKIP accounting, to re-arm can_read_next.
 			if cd_end_count /= seen_end then
+				if G_BLIND_READ then rh_can := true; end if;
 				seen_end := cd_end_count;
 			end if;
 			-- Simplified push mode assumes the pre-load transaction completed,
@@ -1726,7 +1889,38 @@ begin
 				end if;
 				removed := (to_integer(rd_cons_hw) - cons_base)
 				         + (skip0 - to_integer(rd_skip_hw));
-				if G_REAL_HPS then
+				if G_BLIND_READ then
+					-- A synthetic disc, but actual Main-style transport: one
+					-- sector per 16 ms, CD_DATA_END acknowledgement, and immediate
+					-- GOOD after the last host burst, before the CPU drains it.
+					if rh_sect_cnt > 0 then rh_sect_cnt := rh_sect_cnt - 1; end if;
+					if state = H_READ and rdcnt > 0 and rh_can and rh_sect_cnt = 0 then
+						rh_can := false;
+						rh_sect_cnt := 320;
+						pushed := pushed + 2048;
+						for i in 0 to 2047 loop
+							if i = 2 and lba >= 16#900# and lba < 16#902# then
+								wait for 100 us; -- host pause after two fresh-sector bytes
+							end if;
+							cd_data <= blind_byte(lba, i);
+							cd_data_wr <= '1'; wait for 2*CLK_PERIOD;
+							cd_data_wr <= '0'; wait for 2*CLK_PERIOD;
+						end loop;
+						lba := lba + 1;
+						rdcnt := rdcnt - 1;
+						if rdcnt = 0 then
+							assert << signal .tb_cd.DUT.CD.SCSI.EMPTY : std_logic >> = '0'
+								report "TBCD BLIND setup: GOOD was not early" severity failure;
+							state := H_IDLE;
+							cd_stat <= x"00";
+							wait until rising_edge(clk);
+							cd_stat_get <= '1';
+							wait until rising_edge(clk);
+							cd_stat_get <= '0';
+							blind_early_status <= blind_early_status + 1;
+						end if;
+					end if;
+				elsif G_REAL_HPS then
 					-- real cd.cpp serving: one 2048-byte sector per 16 ms tick,
 					-- only when the seek latency has expired and the core has
 					-- consumed the previous sector (can_read_next).  The re-arm
@@ -1885,79 +2079,6 @@ begin
 		end loop;
 	end process;
 
-	bootdbg2 : process
-		alias cpu_pc  is << signal .tb_cd.DUT.CPU.CORE.PC : std_logic_vector(15 downto 0) >>;
-		alias scsi_pos is << signal .tb_cd.DUT.CD.SCSI.COMM_POS : unsigned(3 downto 0) >>;
-		alias scsi_b0  is << signal .tb_cd.DUT.CD.SCSI.SP_ENC : std_logic_vector(3 downto 0) >>;
-		alias q_stat  is << signal .tb_cd.DUT.CD.SCSI.STAT_PEND : std_logic >>;
-		alias q_dout  is << signal .tb_cd.DUT.CD.SCSI.DOUT_PEND : std_logic >>;
-		alias q_empty is << signal .tb_cd.DUT.CD.SCSI.EMPTY : std_logic >>;
-		alias q_swal  is << signal .tb_cd.DUT.CD.SCSI.SWALLOW : unsigned(1 downto 0) >>;
-		alias q_dma   is << signal .tb_cd.DUT.CD.DMA_WRITE_PEND : std_logic >>;
-		alias q_cons  is << signal .tb_cd.DUT.CD.CDDA_CONSUMED : unsigned(31 downto 0) >>;
-		alias q_rsect is << signal .tb_cd.DUT.CD.SCSI.RP_SECT : unsigned(23 downto 0) >>;
-	begin
-		for i in 1 to 40 loop
-			wait for 100 us;
-			exit when hps_d8_count > 0;
-			report "BOOTDBG t=" & time'image(now) & " PC=" & to_hstring(cpu_pc)
-				& " SP=" & to_hstring(scsi_b0) & " POS=" & integer'image(to_integer(scsi_pos));
-		end loop;
-		-- Sample throughout the run; READ_CONSUMED shows stream progress.
-		loop
-			wait for 5 ms;
-			report "POSTDBG t=" & time'image(now) & " PC=" & to_hstring(cpu_pc)
-				& " SP=" & to_hstring(scsi_b0)
-				& " stat=" & std_logic'image(q_stat) & " dout=" & std_logic'image(q_dout)
-				& " empty=" & std_logic'image(q_empty)
-				& " swal=" & integer'image(to_integer(q_swal))
-				& " cons=" & integer'image(to_integer(q_cons))
-				& " rsect=" & integer'image(to_integer(q_rsect))
-				& " rdcons=" & integer'image(to_integer(
-					<< signal .tb_cd.DUT.CD.SCSI.READ_CONSUMED : unsigned(20 downto 0) >>))
-				& " d8=" & integer'image(hps_d8_count);
-		end loop;
-	end process;
-
-	-- Log re-issued commands, resume LBA/count and byte drain for scenario C.
-	rp_mon : process
-		alias rp_send is << signal .tb_cd.DUT.CD.SCSI.RP_SEND : std_logic >>;
-		alias rp_comm is << signal .tb_cd.DUT.CD.SCSI.RP_COMM : std_logic_vector(95 downto 0) >>;
-		alias rd_cons is << signal .tb_cd.DUT.CD.SCSI.READ_CONSUMED : unsigned(20 downto 0) >>;
-		alias rp_rskip is << signal .tb_cd.DUT.CD.SCSI.RP_RSKIP : unsigned(11 downto 0) >>;
-		alias rd_act  is << signal .tb_cd.DUT.CD.SCSI.READ_ACTIVE : std_logic >>;
-		alias sp_enc  is << signal .tb_cd.DUT.CD.SCSI.SP_ENC : std_logic_vector(3 downto 0) >>;
-		-- CDDA replay arithmetic, measured rather than inferred: the sample
-		-- position a resume lands on is RP_SECT (folded into the loop window
-		-- using RP_LEN) plus REPLAY_SKIP, all derived from RP_CONS.  Printing
-		-- the four together at the moment the command goes out says which term
-		-- is wrong instead of leaving it to be deduced from the audio.
-		alias rp_cons  is << signal .tb_cd.DUT.CD.SCSI.RP_CONS : unsigned(31 downto 0) >>;
-		alias rp_sect  is << signal .tb_cd.DUT.CD.SCSI.RP_SECT : unsigned(23 downto 0) >>;
-		alias rp_len   is << signal .tb_cd.DUT.CD.SCSI.RP_LEN : unsigned(23 downto 0) >>;
-		alias rp_skip  is << signal .tb_cd.DUT.CD.REPLAY_SKIP : unsigned(9 downto 0) >>;
-		alias cdda_con is << signal .tb_cd.DUT.CD.CDDA_CONSUMED : unsigned(31 downto 0) >>;
-	begin
-		loop
-			wait until rising_edge(clk);
-			if rp_send = '1' then
-				report "RPSEND cmd=" & to_hstring(rp_comm(7 downto 0))
-					& " b1=" & to_hstring(rp_comm(15 downto 8))
-					& " lba=" & to_hstring(rp_comm(12 downto 8) & rp_comm(23 downto 16) & rp_comm(31 downto 24))
-					& " cnt=" & to_hstring(rp_comm(39 downto 32))
-					& " CONS=" & integer'image(to_integer(rd_cons))
-					& " RSKIP=" & integer'image(to_integer(rp_rskip))
-					& " RDACT=" & std_logic'image(rd_act)
-					& " SP=" & to_hstring(sp_enc)
-					& " | RP_CONS=" & integer'image(to_integer(rp_cons))
-					& " RP_SECT=" & integer'image(to_integer(rp_sect))
-					& " RP_LEN=" & integer'image(to_integer(rp_len))
-					& " SKIP=" & integer'image(to_integer(rp_skip))
-					& " CDDA_CONSUMED=" & integer'image(to_integer(cdda_con));
-			end if;
-		end loop;
-	end process;
-
 	-- Mismatch monitor: fires the first time the reader stores the fail flag
 	-- ($FE58 STA $2012), logging the RTL's DATAIN byte position so the
 	-- reader-vs-stream desync can be read off directly.
@@ -1993,149 +2114,6 @@ begin
 				c_fail <= '1';
 			end if;
 		end loop;
-	end process;
-
-	-- Byte trace around the post-replay resume: logs the stream position and the
-	-- staged byte for the first handshakes after the drain finishes, plus what
-	-- the CPU actually loaded, so a resume misalignment can be read off directly
-	-- instead of inferred from the fail flag.
-	bt_mon : process
-		alias rskip is << signal .tb_cd.DUT.CD.SCSI.READ_SKIP : unsigned(11 downto 0) >>;
-		alias cons  is << signal .tb_cd.DUT.CD.SCSI.READ_CONSUMED : unsigned(20 downto 0) >>;
-		alias dbo   is << signal .tb_cd.DUT.CD.SCSI.DBO_r : std_logic_vector(7 downto 0) >>;
-		-- drain accounting: every FIFO_RD_REQ that the FIFO actually honours is a
-		-- popped byte; comparing that with how far READ_SKIP fell says straight
-		-- away whether the drain skipped the number of bytes it claimed to
-		alias frdreq is << signal .tb_cd.DUT.CD.SCSI.FIFO_RD_REQ : std_logic >>;
-		alias fempty is << signal .tb_cd.DUT.CD.SCSI.EMPTY : std_logic >>;
-		variable prev_cons : integer := -1;
-		variable armed : boolean := false;
-		variable n : integer := 0;
-		variable pops, decs, prev_rskip, wrs : integer := 0;
-		variable wr_d : std_logic := '0';
-	begin
-		loop
-			wait until rising_edge(clk);
-			-- count pops, READ_SKIP decrements and bytes the drive pushed while a
-			-- drain is in progress
-			if rskip /= 0 or prev_rskip /= 0 then
-				if frdreq = '1' and fempty = '0' then pops := pops + 1; end if;
-				if cd_data_wr = '1' and wr_d = '0' then wrs := wrs + 1; end if;
-				if to_integer(rskip) = prev_rskip - 1 then decs := decs + 1; end if;
-				if to_integer(rskip) = 0 and prev_rskip = 1 then
-					report "BT DRAIN done: decs=" & integer'image(decs)
-						& " pops=" & integer'image(pops)
-						& " drive_wrote=" & integer'image(wrs) & " t=" & time'image(now);
-					pops := 0; decs := 0; wrs := 0;
-				end if;
-			end if;
-			wr_d := cd_data_wr;
-			prev_rskip := to_integer(rskip);
-			if rskip /= 0 then armed := true; n := 0; end if;
-			if armed then
-				if to_integer(cons) /= prev_cons and n < 10 then
-					report "BT CONS=" & integer'image(to_integer(cons))
-						& " DBO=" & integer'image(to_integer(unsigned(dbo)))
-						& " t=" & time'image(now);
-					n := n + 1;
-				end if;
-			end if;
-			prev_cons := to_integer(cons);
-		end loop;
-	end process;
-
-	-- CDDA drain accounting: the B/G resumes land 2-3 samples EARLY, with the
-	-- replay arithmetic proven exact (RPSEND: sector + SKIP add up to the
-	-- consumed count), so the loss must be in the skip drain itself.  Count,
-	-- for every armed skip, the SKIP_LEFT decrements against the pops the
-	-- FIFO actually honoured and the samples the DAC branch delivered while
-	-- the drain was still open: whichever pair disagrees names the defect.
-	cdda_drain_mon : process(clk)
-		alias skipl  is << signal .tb_cd.DUT.CD.SKIP_LEFT : unsigned(9 downto 0) >>;
-		alias frdreq is << signal .tb_cd.DUT.CD.FIFO_RD_REQ : std_logic >>;
-		alias fempty is << signal .tb_cd.DUT.CD.FIFO_EMPTY : std_logic >>;
-		alias fwrreq is << signal .tb_cd.DUT.CD.FIFO_WR_REQ : std_logic >>;
-		alias fwrd   is << signal .tb_cd.DUT.CD.FIFO_D : std_logic_vector(31 downto 0) >>;
-		alias rp_fl  is << signal .tb_cd.DUT.CD.REPLAY_START : std_logic >>;
-		alias fq     is << signal .tb_cd.DUT.CD.FIFO_Q : std_logic_vector(31 downto 0) >>;
-		variable fl_d : std_logic := '0';
-		variable wr_n : integer := 99;
-		variable prev_skip : integer := 0;
-		variable armed_at  : integer := 0;
-		variable tape_at_arm : integer := 0;
-		variable decs, pops, reqs, misses : integer := 0;
-		variable qlast : integer := -1;
-		variable in_drain : boolean := false;
-		variable v0, v1, v2, v3 : integer := -1;	-- last four delivered values
-		variable prev_out : integer := -1;
-		variable post_n : integer := 99;
-	begin
-		if rising_edge(clk) then
-			-- Timestamp output samples around each flush and drain.
-			if to_integer(signed(cdda_sl)) /= prev_out then
-				prev_out := to_integer(signed(cdda_sl));
-				v3 := v2; v2 := v1; v1 := v0; v0 := prev_out;
-				if post_n < 6 then
-					report "CDDA OUT#" & integer'image(post_n)
-						& " val=" & integer'image(prev_out)
-						& " t=" & time'image(now);
-					post_n := post_n + 1;
-				end if;
-			end if;
-			-- First FIFO writes distinguish a stale tail from resumed data.
-			if rp_fl = '1' and fl_d = '0' then
-				wr_n := 0;
-				report "CDDA FLUSH tape=" & integer'image(slog_count)
-					& " last_out=" & integer'image(v3) & " " & integer'image(v2)
-					& " " & integer'image(v1) & " " & integer'image(v0)
-					& " t=" & time'image(now);
-			end if;
-			fl_d := rp_fl;
-			if fwrreq = '1' and wr_n < 8 then
-				report "CDDA WR#" & integer'image(wr_n)
-					& " val=" & integer'image(to_integer(unsigned(fwrd(15 downto 0))))
-					& " t=" & time'image(now);
-				wr_n := wr_n + 1;
-			end if;
-			if to_integer(skipl) > prev_skip then
-				-- the arm (REPLAY_START loads REPLAY_SKIP)
-				in_drain := true;
-				armed_at := to_integer(skipl);
-				tape_at_arm := slog_count;
-				decs := 0; pops := 0; reqs := 0; misses := 0; qlast := -1;
-			elsif in_drain then
-				if frdreq = '1' then
-					reqs := reqs + 1;
-					if fempty = '0' then
-						pops := pops + 1;
-						qlast := to_integer(unsigned(fq(15 downto 0)));
-					else
-						-- a request the FIFO cannot honour: the skip counter
-						-- has already paid for a sample that never left
-						misses := misses + 1;
-						if misses <= 4 then
-							report "CDDA DRAIN MISS #" & integer'image(misses)
-								& " skipl=" & integer'image(to_integer(skipl))
-								& " t=" & time'image(now);
-						end if;
-					end if;
-				end if;
-				if to_integer(skipl) = prev_skip - 1 then decs := decs + 1; end if;
-				if to_integer(skipl) = 0 and prev_skip /= 0 then
-					report "CDDA DRAIN done: armed=" & integer'image(armed_at)
-						& " decs=" & integer'image(decs)
-						& " reqs=" & integer'image(reqs)
-						& " pops=" & integer'image(pops)
-						& " misses=" & integer'image(misses)
-						& " last_drained=" & integer'image(qlast)
-						& " delivered_during=" & integer'image(slog_count - tape_at_arm)
-						& " t=" & time'image(now);
-					in_drain := false;
-					post_n := 0;	-- log the next deliveries with timestamps
-				end if;
-			end if;
-			prev_skip := to_integer(skipl);
-		end if;
 	end process;
 
 	fl_mon : process(clk)
@@ -2284,6 +2262,8 @@ begin
 				--   reader   $FE00-$FE9B
 				--   boot     $FF00-$FF4B
 				--   CD-RAM   $6000-$6003
+				--   blind    $F000-$F073, $F0E0-$F0E3, $F100-$F139,
+				--            $F150-$F15A, $F180-$F193, $F1A0-$F1D5 (opt-in)
 				bad := false;
 				if is_x(gpc) then
 					bad := true;
@@ -2299,7 +2279,14 @@ begin
 				        or (unsigned(gpc) >= 16#FD00# and unsigned(gpc) <= 16#FD89#)
 				        or (unsigned(gpc) >= 16#FDC0# and unsigned(gpc) <= 16#FDD5#)
 				        or (unsigned(gpc) >= 16#FE00# and unsigned(gpc) <= 16#FE9B#)
-				        or (unsigned(gpc) >= 16#FF00# and unsigned(gpc) <= 16#FFBD#)) then
+				        or (unsigned(gpc) >= 16#FF00# and unsigned(gpc) <= 16#FFBD#)
+				        or (G_BLIND_READ and
+				             ((unsigned(gpc) >= 16#F000# and unsigned(gpc) <= 16#F073#)
+				           or (unsigned(gpc) >= 16#F0E0# and unsigned(gpc) <= 16#F0E3#)
+				           or (unsigned(gpc) >= 16#F100# and unsigned(gpc) <= 16#F139#)
+				           or (unsigned(gpc) >= 16#F150# and unsigned(gpc) <= 16#F15A#)
+				           or (unsigned(gpc) >= 16#F180# and unsigned(gpc) <= 16#F193#)
+				           or (unsigned(gpc) >= 16#F1A0# and unsigned(gpc) <= 16#F1D5#)))) then
 					bad := true;
 				end if;
 
@@ -2393,11 +2380,11 @@ begin
 	-- oracle carrying its own state would have to be rewound too, and would
 	-- then be checking itself instead of the DUT.
 	--
-	-- What the three verdicts catch:
+	-- Monitor results:
 	--   h_fail  a byte written at the wrong place, or the wrong byte written
 	--           (a resumed stream off by n bytes fails on the first write)
-	--   h_cov   every one of the 8192 nibbles written at least once, i.e. the
-	--           replay left no HOLE (bytes skipped at the resume point)
+	--   h_cov   reports distinct addresses written in the 131072-entry
+	--           nibble memory; it is not a verdict.
 	--   h_after requires writes after load, not just before save.
 	--
 	-- Gated on SLEEP='0': during a walk the same port carries the savestate
@@ -2485,11 +2472,6 @@ begin
 		end loop;
 	end process;
 
-	-- ------------------------------------------------------------------
-	-- Scenario H diagnostics: ACK/AUTO_ACK at freeze distinguish stored
-	-- data from a pending byte; READ_SKIP, DATAIN_HELD and DBO at the first
-	-- post-load write show what released it. Reports only, no verdict.
-	-- ------------------------------------------------------------------
 	-- Scenario I: count the $DD replies the PROGRAM actually finishes, by
 	-- watching the PC reach the "INC $2021" that closes the SUBQ routine.
 	-- Counted on the TRANSITION into that address, not on its presence: the PC
@@ -2609,23 +2591,10 @@ begin
 	end process;
 
 	-- ------------------------------------------------------------------
-	-- Scenario W diagnostics: capture counters at freeze, FIFO/phase/DBO
-	-- at drain end, and the first 12 subsequent DATAIN handshakes.
+	-- Scenario W: capture the deferred status slot and AUD_OPEN at freeze.
 	-- ------------------------------------------------------------------
 	w_probe : process
-		alias pskp is << signal .tb_cd.DUT.CD.SCSI.READ_SKIP : unsigned(11 downto 0) >>;
-		alias pcns is << signal .tb_cd.DUT.CD.SCSI.READ_CONSUMED : unsigned(20 downto 0) >>;
-		alias pdin is << signal .tb_cd.DUT.CD.SCSI.DATAIN_CNT : unsigned(15 downto 0) >>;
-		alias pdbo is << signal .tb_cd.DUT.CD.SCSI.DBO_r : std_logic_vector(7 downto 0) >>;
-		alias pemp is << signal .tb_cd.DUT.CD.SCSI.EMPTY : std_logic >>;
-		alias pstp is << signal .tb_cd.DUT.CD.SCSI.STAT_PEND : std_logic >>;
-		alias psp  is << signal .tb_cd.DUT.CD.SCSI.SP_ENC : std_logic_vector(3 downto 0) >>;
-		alias pact is << signal .tb_cd.DUT.CD.SCSI.READ_ACTIVE : std_logic >>;
-		alias paud is << signal .tb_cd.DUT.CD.SCSI.AUDIO_ACTIVE : std_logic >>;
 		alias popn is << signal .tb_cd.DUT.CD.SCSI.AUD_OPEN : std_logic >>;
-		variable prev_skip : integer := 0;
-		variable prev_din  : integer := 0;
-		variable logn      : integer := 0;
 		variable slp_d     : std_logic := '0';
 	begin
 		if not (G_DO_W or G_DO_W2 or G_DO_W3) then wait; end if;
@@ -2634,39 +2603,8 @@ begin
 			if ss_sleep = '1' and slp_d = '0' then
 				w_frz_slot    <= hps_slot;
 				w_frz_audopen <= popn;
-				report "TBCD W FRZ: CONS=" & integer'image(to_integer(pcns))
-					& " SP=" & to_hstring(psp)
-					& " RDACT=" & std_logic'image(pact)
-					& " AUDACT=" & std_logic'image(paud)
-					& " AUDOPEN=" & std_logic'image(popn)
-					& " SLOT=" & std_logic'image(hps_slot)
-					& " SKIP=" & integer'image(to_integer(pskp))
-					& " EMPTY=" & std_logic'image(pemp)
-					& " STAT_PEND=" & std_logic'image(pstp)
-					& " DATAIN_CNT=" & integer'image(to_integer(pdin))
-					& " t=" & time'image(now);
 			end if;
 			slp_d := ss_sleep;
-			if prev_skip /= 0 and to_integer(pskp) = 0 then
-				report "TBCD W DRAIN END: EMPTY=" & std_logic'image(pemp)
-					& " STAT_PEND=" & std_logic'image(pstp)
-					& " SP=" & to_hstring(psp)
-					& " DBO=" & to_hstring(pdbo)
-					& " CONS=" & integer'image(to_integer(pcns))
-					& " DATAIN_CNT=" & integer'image(to_integer(pdin))
-					& " t=" & time'image(now);
-				logn := 12;
-				prev_din := to_integer(pdin);
-			end if;
-			prev_skip := to_integer(pskp);
-			if logn > 0 and to_integer(pdin) /= prev_din then
-				report "TBCD W BYTE: DATAIN_CNT=" & integer'image(to_integer(pdin))
-					& " DBO=" & to_hstring(pdbo)
-					& " SP=" & to_hstring(psp)
-					& " t=" & time'image(now);
-				logn := logn - 1;
-				prev_din := to_integer(pdin);
-			end if;
 		end loop;
 	end process;
 
@@ -2716,36 +2654,13 @@ begin
 		alias c_en    is << signal .tb_cd.DUT.CPU.EN : std_logic >>;
 		alias c_slp   is << signal .tb_cd.DUT.CPU.SLEEP : std_logic >>;
 		alias c_state is << signal .tb_cd.DUT.CPU.CORE.STATE : unsigned(4 downto 0) >>;
-		alias c_cnt   is << signal .tb_cd.DUT.CPU.CPU_CLK_CNT : unsigned(4 downto 0) >>;
-		alias c_cs    is << signal .tb_cd.DUT.CPU.CPU_CS : std_logic >>;
-		alias c_ce    is << signal .tb_cd.DUT.CPU.CPU_CE : std_logic >>;
 		variable slp_old : std_logic := '0';
 		variable st_frz  : integer := -1;
-		variable trace   : integer := 0;
 	begin
 		loop
 			wait until rising_edge(clk);
 			if c_slp = '1' and slp_old = '0' then
 				st_frz := to_integer(c_state);
-				trace  := 4;
-				-- The phase decides whether a CE is already in flight when the
-				-- freeze lands: the generator fires at CPU_CLK_CNT = 5 (CS=1) or
-				-- 23 (CS=0), so only a freeze taken on the cycle right before
-				-- that can leak one.  Printing it turns "we did not see it" into
-				-- "we did not see it AND here is why", instead of luck.
-				report "TBCD ST0 freeze: CLK_CNT=" & integer'image(to_integer(c_cnt))
-					& " CS=" & std_logic'image(c_cs)
-					& " CE=" & std_logic'image(c_ce)
-					& " EN=" & std_logic'image(c_en)
-					& " STATE=" & integer'image(st_frz)
-					& " t=" & time'image(now);
-			elsif trace > 0 then
-				trace := trace - 1;
-				report "TBCD ST0 +" & integer'image(4 - trace)
-					& ": CE=" & std_logic'image(c_ce)
-					& " EN=" & std_logic'image(c_en)
-					& " STATE=" & integer'image(to_integer(c_state))
-					& " SLEEP=" & std_logic'image(c_slp);
 			end if;
 			if c_slp = '1' then
 				if c_en = '1' then
@@ -2768,63 +2683,6 @@ begin
 		end loop;
 	end process;
 
-	h_diag : process
-		alias d_we    is << signal .tb_cd.DUT.CD.ADRAM_WE : std_logic >>;
-		alias d_adr   is << signal .tb_cd.DUT.CD.ADRAM_A  : std_logic_vector(16 downto 0) >>;
-		alias d_di    is << signal .tb_cd.DUT.CD.ADRAM_DI : std_logic_vector(3 downto 0) >>;
-		alias d_slp   is << signal .tb_cd.DUT.CD.SLEEP    : std_logic >>;
-		alias d_reqn  is << signal .tb_cd.DUT.CD.SCSI_REQ_N : std_logic >>;
-		alias d_ackn  is << signal .tb_cd.DUT.CD.SCSI_ACK_N : std_logic >>;
-		alias d_auto  is << signal .tb_cd.DUT.CD.AUTO_ACK : std_logic >>;
-		alias d_pend  is << signal .tb_cd.DUT.CD.DMA_WRITE_PEND : std_logic >>;
-		alias d_nib   is << signal .tb_cd.DUT.CD.ADPCM_WRITE_NIB : std_logic >>;
-		alias d_dbo   is << signal .tb_cd.DUT.CD.SCSI_DBO : std_logic_vector(7 downto 0) >>;
-		alias d_wrd   is << signal .tb_cd.DUT.CD.ADPCM_WRDATA : std_logic_vector(7 downto 0) >>;
-		alias d_wra   is << signal .tb_cd.DUT.CD.ADPCM_WRADDR : std_logic_vector(16 downto 0) >>;
-		alias d_held  is << signal .tb_cd.DUT.CD.SCSI_DATAIN_HELD : std_logic >>;
-		alias d_skip  is << signal .tb_cd.DUT.CD.SCSI.READ_SKIP : unsigned(11 downto 0) >>;
-		alias d_sp    is << signal .tb_cd.DUT.CD.SCSI.SP_ENC : std_logic_vector(3 downto 0) >>;
-		alias d_cons  is << signal .tb_cd.DUT.CD.SCSI.READ_CONSUMED : unsigned(20 downto 0) >>;
-		variable slp_old : std_logic := '0';
-		variable shot    : boolean := false;
-	begin
-		loop
-			wait until rising_edge(clk);
-			if h_arm = '1' and d_slp = '1' and slp_old = '0' and h_mark = '0' then
-				report "TBCD H DIAG @save-freeze:"
-					& " WRADDR=" & integer'image(to_integer(unsigned(d_wra)))
-					& " CONS=" & integer'image(to_integer(d_cons))
-					& " SP=" & to_hstring(d_sp)
-					& " REQ_N=" & std_logic'image(d_reqn)
-					& " ACK_N=" & std_logic'image(d_ackn)
-					& " AUTO_ACK=" & std_logic'image(d_auto)
-					& " DMA_PEND=" & std_logic'image(d_pend)
-					& " WR_NIB=" & std_logic'image(d_nib)
-					& " DBO=" & to_hstring(d_dbo)
-					& " WRDATA=" & to_hstring(d_wrd);
-			end if;
-			slp_old := d_slp;
-
-			if h_mark = '1' and not shot and d_slp = '0' and d_we = '1' then
-				shot := true;
-				report "TBCD H DIAG @first-write-after-load:"
-					& " addr=" & integer'image(to_integer(unsigned(d_adr)))
-					& " nib=" & to_hstring(d_di)
-					& " WRADDR=" & integer'image(to_integer(unsigned(d_wra)))
-					& " CONS=" & integer'image(to_integer(d_cons))
-					& " SP=" & to_hstring(d_sp)
-					& " HELD=" & std_logic'image(d_held)
-					& " READ_SKIP=" & integer'image(to_integer(d_skip))
-					& " REQ_N=" & std_logic'image(d_reqn)
-					& " ACK_N=" & std_logic'image(d_ackn)
-					& " AUTO_ACK=" & std_logic'image(d_auto)
-					& " DMA_PEND=" & std_logic'image(d_pend)
-					& " DBO=" & to_hstring(d_dbo)
-					& " WRDATA=" & to_hstring(d_wrd);
-			end if;
-		end loop;
-	end process;
-
 	e_mon : process
 		-- SP itself has an architecture-private type, so the phase is read off
 		-- SP_ENC (sp_encode order: SP_DATAIN_START = 10 = 0xA)
@@ -2836,7 +2694,6 @@ begin
 		alias ackn     is << signal .tb_cd.DUT.CD.SCSI_ACK_N : std_logic >>;
 		alias spenc    is << signal .tb_cd.DUT.CD.SCSI.SP_ENC : std_logic_vector(3 downto 0) >>;
 		variable nbad : integer := 0;
-		variable nok  : integer := 0;
 	begin
 		loop
 			wait until rising_edge(clk);
@@ -2851,8 +2708,6 @@ begin
 							& " t=" & time'image(now) severity error;
 					end if;
 					e_fail <= '1';
-				else
-					nok := nok + 1;
 				end if;
 			end if;
 		end loop;
@@ -2975,15 +2830,39 @@ begin
 					end if;
 				end if;
 				if is_load then
-					-- tight PC trace right after resume: a wild PC here is a
-					-- restore bug, and the first samples show the divergence
-					for k in 1 to 12 loop
-						wait for 2 us;
-						report "RESUME(" & tag & ") +" & integer'image(k*2) & "us PC="
-							& to_hstring(<< signal .tb_cd.DUT.CPU.CORE.PC : std_logic_vector(15 downto 0) >>);
-					end loop;
+					wait for 24 us;
 				end if;
 				wait_cycles(10);
+			end procedure;
+			procedure check_blind(slot : integer; tag : string) is
+				variable data : std_logic_vector(63 downto 0);
+				variable pos, lane : integer;
+				variable expected : std_logic_vector(7 downto 0);
+			begin
+				-- WRAM $2040/$2041 and the actual VRAM0 savestate region.
+				-- No bus-forwarding echo or producer counter is a data oracle.
+				assert slot_word(slot, 137)(15 downto 0) = x"0002"
+					report "TBCD BLIND " & tag & ": STATUS/MSGIN did not close cleanly"
+					severity failure;
+				assert slot_word(slot, 56)(3 downto 0) = x"0"
+				   and slot_word(slot, 56)(23) = '0'
+					report "TBCD BLIND " & tag & ": READ/bus remains active" severity failure;
+				for i in 0 to BLIND_BYTES-1 loop
+					pos := BLIND_VRAM_BYTE + i;
+					lane := pos mod 8;
+					data := slot_word(slot, 129 + 4096 + pos / 8);
+					if i < 3*2048 then
+						expected := blind_byte(16#400# + i / 2048, i mod 2048);
+					else
+						expected := blind_byte(16#900# + (i - 3*2048) / 2048, i mod 2048);
+					end if;
+					assert data(lane*8+7 downto lane*8) = expected
+						report "TBCD BLIND " & tag & ": VRAM byte " & integer'image(pos)
+							& " transfer offset " & integer'image(i)
+							& " got=" & to_hstring(data(lane*8+7 downto lane*8))
+							& " expected=" & to_hstring(expected)
+						severity failure;
+				end loop;
 			end procedure;
 			-- A resumed CDDA stream must restart with the machine: the release
 			-- that wakes CPU and video and the first resumed sample at the DAC
@@ -3068,13 +2947,58 @@ begin
 			variable t_ld    : time;	-- end of the last load walk
 			variable mark    : integer;
 			variable k_int_base : integer;	-- scenario K: completions before the save
-			variable req_base, ack_base, cons_base : integer;	-- scenario L: landmarks before save
 			variable k_ack_base : integer;	-- scenario K: program ACKs before the load
 			variable exp, got : integer;
 			variable idx      : integer;
 		begin
 			wait_cycles(20);
 			reset <= '0';
+			if G_BLIND_READ then
+				assert not G_REAL_HPS and not G_PUSH_STATUS
+					report "TBCD BLIND requires its CD_DATA_END-gated host mode" severity failure;
+				report "TBCD: === BLIND real-HuC6280 READ6 -> VDC, partial-sector save/load ===";
+				t_dead := now + 100 ms;
+				while (w_cons /= 21 or w_sp /= x"A") and now < t_dead loop
+					wait until rising_edge(clk);
+				end loop;
+				assert w_cons = 21 and w_sp = x"A"
+					report "TBCD BLIND setup: did not reach offset21/phase10" severity failure;
+				do_ss(0, false, "BLIND odd-byte anchor");
+				assert slot_word(0, 65)(63 downto 43) = std_logic_vector(to_unsigned(21, 21))
+				   and slot_word(0, 56)(3 downto 0) = x"A"
+				   and slot_word(0, 54)(8) = '1' and slot_word(0, 54)(21) = '0'
+					report "TBCD BLIND setup: anchor missed offset21/phase10/ACK-idle"
+					severity failure;
+				assert slot_word(0, 56)(31 downto 24) = blind_byte(16#400#, 21)
+				   and slot_word(0, 26)(39 downto 32) = blind_byte(16#400#, 20)
+				   and slot_word(0, 26)(15 downto 0) = x"200A"
+					report "TBCD BLIND setup: staged CD byte or odd VDC low-byte latch differs"
+					severity failure;
+				for pass in 1 to 2 loop
+					if pass = 2 then do_ss(0, true, "BLIND restore odd-byte anchor"); end if;
+					t_dead := now + 300 ms;
+					while j_pc /= x"F0E0" and now < t_dead loop
+						wait for 10 us;
+					end loop;
+					assert j_pc = x"F0E0"
+						report "TBCD BLIND: CPU never completed both READs, PC=" & to_hstring(j_pc)
+							& " SP=" & to_hstring(w_sp)
+							& " consumed=" & integer'image(to_integer(w_cons))
+						severity failure;
+					do_ss(pass, false, "BLIND destination oracle " & integer'image(pass));
+					check_blind(pass, "pass " & integer'image(pass));
+				end loop;
+				assert blind_early_status = 4
+					report "TBCD BLIND: both timelines did not exercise early GOOD twice"
+					severity failure;
+				assert ss_blob_bad = 0 and ss_en_leak = 0 and ss_state_bad = 0
+					report "TBCD BLIND: actual CPU freeze/refetch boundary violated"
+					severity failure;
+				report "TBCD BLIND PASSED: 10240 VRAM bytes exact before/after restore; "
+					& "both READ6 STATUS/MSGIN transactions closed in each timeline";
+				std.env.finish;
+				wait;
+			end if;
 			-- armed from the start: no ADPCM RAM write can happen before the DMA
 			-- routine runs (the program never writes $180A), and the walk's own
 			-- writes are excluded by the SLEEP gate inside h_mon
@@ -3286,9 +3210,8 @@ begin
 			-- STATUS and MSGIN bytes must be taken and the transaction closed.
 			----------------------------------------------------------------
 			mark := w_read6_cnt;	-- the pre-load timeline may have issued one
-			-- cons_a is the fresh-read completion count snapshot from BEFORE the
-			-- load: the dead timeline closed one fresh READ6 in its >25 ms of
-			-- runway, so only a count ABOVE the snapshot is the restored one
+			-- cons_a is the fresh-read completion baseline after load #2's walk.
+			-- Only a higher count belongs to the restored timeline.
 			t_dead := now + 150 ms;
 			while w_fresh_done <= cons_a and now < t_dead loop
 				wait for 100 us;
@@ -3322,10 +3245,8 @@ begin
 			----------------------------------------------------------------
 			report "TBCD W2: === stage-0 transition: D8/D9 + audio-window save/load "
 				& "+ back-to-back READ6s ===";
-			-- cons_g = w2_audio snapshot from before load #2: the dead timeline
-			-- already fired the audio marker once, so waiting for ">= 1" here
-			-- would trigger save #3 while the restored timeline is still in the
-			-- replay - only a count ABOVE the snapshot is the restored D8/D9
+			-- cons_g is the audio-marker baseline after load #2's walk.
+			-- Only a higher count belongs to the restored D8/D9.
 			t_dead := now + 100 ms;
 			while w2_audio <= cons_g and now < t_dead loop
 				wait for 100 us;
@@ -3777,7 +3698,7 @@ begin
 					& "presented to the program and the bus is parked"
 				severity failure;
 			assert to_integer(l_cnt_ack) = k_ack_base
-				report "TBCD K FAILED: the program made " 
+				report "TBCD K FAILED: the program made "
 					& integer'image(to_integer(l_cnt_ack) - k_ack_base) & " ACKs after the "
 					& "load: that status should never have reached it"
 				severity failure;
@@ -3967,7 +3888,7 @@ begin
 					end if;
 				end loop;
 			end loop;
-			report "TBCD B: flush di QUESTO load (RP_CONS=" & integer'image(cons_a)
+			report "TBCD B: flushes for this load (RP_CONS=" & integer'image(cons_a)
 				& "): nf=" & integer'image(nf)
 				& " [" & integer'image(fl_tmp(0)) & " " & integer'image(fl_tmp(1))
 				& " " & integer'image(fl_tmp(2)) & " " & integer'image(fl_tmp(3)) & "]";
@@ -4125,7 +4046,7 @@ begin
 					end if;
 				end loop;
 			end loop;
-			report "TBCD G: flush di QUESTO load (RP_CONS=" & integer'image(cons_g)
+			report "TBCD G: flushes for this load (RP_CONS=" & integer'image(cons_g)
 				& "): nf=" & integer'image(nf)
 				& " [" & integer'image(fl_tmp(0)) & " " & integer'image(fl_tmp(1))
 				& " " & integer'image(fl_tmp(2)) & " " & integer'image(fl_tmp(3)) & "]";
@@ -4283,8 +4204,8 @@ begin
 			-- load in the run - including the mid-READ ones in scenario A,
 			-- which is where the resume-READ misalignment lives.
 			----------------------------------------------------------------
-			-- the reader must actually have finished its 8 verified READs,
-			-- otherwise "no mismatch" would just mean "no bytes checked"
+			-- The reader must finish its G_READS verified READs;
+			-- otherwise "no mismatch" would just mean "no bytes checked".
 			v := slot_word(3, 131);
 			report "TBCD C: reads completed at the B save = "
 				& integer'image(to_integer(unsigned(v(47 downto 40))));

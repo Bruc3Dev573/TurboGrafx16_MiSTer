@@ -302,7 +302,7 @@ signal ss_frozen         : std_logic := '0';
 signal ss_wd             : unsigned(27 downto 0) := (others => '0');
 signal ss_sleep_eff      : std_logic;
 signal ss_walk_sleep     : std_logic;	-- freeze, restore and refetch; exported as SS_SLEEP
-signal ss_audio_hold     : std_logic;	-- post-load CDDA hold from the CD unit
+signal ss_replay_hold    : std_logic;	-- post-load CD stream hold
 signal ss_saving         : std_logic;
 signal ss_forced         : std_logic := '0';
 signal ss_ac_used_r      : std_logic := '0';
@@ -932,6 +932,7 @@ port map(
 	DM				=> CD_DM,
 	
 	SLEEP				=> ss_sleep_eff,
+	WALK_SLEEP       => ss_walk_sleep,
 	SaveStateBus_Din  => SaveStateBus_Din,
 	SaveStateBus_Adr  => SaveStateBus_Adr,
 	SaveStateBus_wren => SaveStateBus_wren,
@@ -944,8 +945,8 @@ port map(
 	SS_AD_WrData      => Save_RAMWriteData,
 	SS_AD_RdData      => ss_ad_rd,
 	SS_CD_HOLD        => ss_cd_hold,
-	SS_AUDIO_HOLD     => ss_audio_hold,
-	
+	SS_REPLAY_HOLD    => ss_replay_hold,
+
 	CD_SL			=> CDDA_SL,
 	CD_SR			=> CDDA_SR,
 	AD_S			=> ADPCM_S
@@ -1078,11 +1079,8 @@ ss_kick <= '1' when ss_refetch = '1' and ss_refetch_cnt(3 downto 0) = "1000" els
 -- ROM refetch window, so the restored registers are held until the fetch
 -- path is fresh.
 ss_walk_sleep <= (sleep_ss and ss_frozen) or ss_load_done or ss_refetch;
--- After a load that resumes CDDA the CD unit extends the freeze until the
--- saved sample is ready at its DAC; the refetch window covers the two
--- clocks the hold needs to arm. The hold is not exported: Main must keep
--- delivering CD data while it lasts.
-ss_sleep_eff <= ss_walk_sleep or ss_audio_hold;
+-- CD replay holds CPU, video and audio together. Main must keep delivering.
+ss_sleep_eff <= ss_walk_sleep or ss_replay_hold;
 
 -- Abort forced saves before the slot header is touched. Do not gate this
 -- with saving_savestate: that signal rises only after the abort decision.
@@ -1091,19 +1089,14 @@ ss_save_abort <= ss_forced;
 
 SSMANAGER : entity work.statemanager
 generic map (
-	Softmap_SaveState_ADDR => 16#3800000#,	-- DWORD addr = byte 0x0E000000 in the 0x30000000 window = DDR3 0x3E000000
-	Softmap_Rewind_ADDR    => 16#3800000#	-- rewind unused
+	Softmap_SaveState_ADDR => 16#3800000#	-- DWORD addr = byte 0x0E000000 in the 0x30000000 window = DDR3 0x3E000000
 )
 port map (
 	clk               => CLK,
 	reset             => RESET or SS_INHIBIT,
-	rewind_on         => '0',
-	rewind_active     => '0',
 	savestate_number  => to_integer(unsigned(SS_SLOT)),
 	save              => SS_SAVE,
 	load              => SS_LOAD,
-	sleep_rewind      => open,
-	vsync             => not VS_N,
 	request_savestate => ss_req_save,
 	request_loadstate => ss_req_load,
 	request_address   => ss_addr_int,

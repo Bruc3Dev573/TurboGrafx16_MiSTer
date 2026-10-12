@@ -1651,7 +1651,8 @@ begin
 	VDE_END_POS_DBG <= VDE_END_POS;
 	
 	-- Savestates
-	-- Not saved (zeroed by reset_ss, rebuilt from VRAM+SAT+registers before unfreeze):
+	-- Not saved: reset_ss clears these; restored VRAM/SAT/registers rebuild them
+	-- as rendering resumes.
 	-- sprite eval/fetch, line buffers, BG pipeline, OFS_Y, FETCH_DOT/FETCH_CE/SLOT.
 
 	GEN_SS_REGS_BACK : for k in 0 to 4 generate

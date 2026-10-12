@@ -82,6 +82,9 @@ reg        wr;
 reg        b;
 reg        ram_req=0;
 
+// tRFC is 66 ns: six clk_ram cycles at 85.9 MHz.
+reg [2:0] refresh_wait = 0;
+
 // access manager
 always @(posedge clk) begin
 	reg old_ref;
@@ -116,6 +119,7 @@ always @(posedge clk) begin
 	end
 
 	q <= q + 1'd1;
+	if(q == STATE_START && mode == MODE_NORMAL && refresh_wait != 0) q <= STATE_START;
 	if(~old_ref & clkref) q <= 0;
 end
 
@@ -156,6 +160,9 @@ localparam CMD_LOAD_MODE       = 3'b000;
 always @(posedge clk) begin
 	reg [15:0] data_reg;
 
+	if(refresh_wait != 0) refresh_wait <= refresh_wait - 1'd1;
+	else if(mode == MODE_NORMAL && q == STATE_START && !ram_req) refresh_wait <= 3'd5;
+
 	SDRAM_DQ <= 16'hZZZZ;
 	casex({ram_req,wr,mode,q})
 		{2'b1X, MODE_NORMAL, STATE_START}: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_ACTIVE;
@@ -169,6 +176,8 @@ always @(posedge clk) begin
 
 		                          default: {SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_NOP;
 	endcase
+	if(mode == MODE_NORMAL && q == STATE_START && refresh_wait != 0)
+		{SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} <= CMD_NOP;
 
 	if(mode == MODE_NORMAL) begin
 		casex(q)

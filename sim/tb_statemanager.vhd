@@ -17,11 +17,11 @@ architecture sim of tb_statemanager is
 begin
 	clk <= not clk after 5 ns;
 	DUT : entity work.statemanager
-	generic map (Softmap_SaveState_ADDR => BASE, Softmap_Rewind_ADDR => BASE)
+	generic map (Softmap_SaveState_ADDR => BASE)
 	port map (
-		clk => clk, reset => reset, rewind_on => '0', rewind_active => '0',
+		clk => clk, reset => reset,
 		savestate_number => slot, save => save, load => load,
-		sleep_rewind => open, vsync => '0', request_savestate => req_save,
+		request_savestate => req_save,
 		request_loadstate => req_load, request_address => req_addr,
 		request_slot => req_slot, request_busy => busy
 	);

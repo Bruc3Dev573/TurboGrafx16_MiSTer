@@ -87,7 +87,8 @@ package pPCE_savestates is
    --  +9 (TIMING): HSW(4:0), HDS(14:8), HDW(22:16), HDE(30:24), VSW(36:32),
    --          VDS(45:38), VDW(55:47) [9b], VDE(63:56) [8b]
    -- OFS_X is restored from BXR in REGS(7) on load_done, not stored separately.
-   -- Sprite/BG pipelines, SPR_CACHE and line buffers are rebuilt by ss_reconstruct.
+   -- Sprite/BG pipelines, SPR_CACHE and line buffers reset, then rebuild from
+   -- restored RAM/registers as rendering resumes.
    -- SAT 256x16: Save_RAM walk, SAVETYPE_SAT0/SAT1, verbatim.
    constant SSREG_INDEX_VDC0      : integer := 25;  -- 25..34
    constant SSREG_INDEX_VDC1      : integer := 35;  -- 35..44 (SGX only, LITE=0)

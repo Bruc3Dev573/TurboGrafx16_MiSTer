@@ -57,10 +57,10 @@ entity cd is
 		AD_S			: out signed(15 downto 0);
 
 		-- Savestates: slots 53-54 and 60-63; SCSI owns 55-59.
-		-- SLEEP freezes the consuming/decoding side; the CDDA/SUBC FIFO fill
-		-- paths stay live, so samples the HPS pushes during the freeze are kept
-		-- while the FIFOs have room.
+		-- FIFOs are not serialized; replay reconstructs their streams after load.
+		-- SLEEP freezes consumption/decoding; FIFO fill stays live within capacity.
 		SLEEP				: in std_logic := '0';
+		WALK_SLEEP       : in std_logic;
 		SaveStateBus_Din  : in  std_logic_vector(63 downto 0) := (others => '0');
 		SaveStateBus_Adr  : in  std_logic_vector(9 downto 0) := (others => '0');
 		SaveStateBus_wren : in  std_logic := '0';
@@ -75,8 +75,8 @@ entity cd is
 		SS_AD_RdData      : out std_logic_vector(7 downto 0);
 		-- CD-quiet veto for the composite boundary
 		SS_CD_HOLD        : out std_logic;
-		-- Post-load audio hold: freeze the machine until resumed CDDA is ready
-		SS_AUDIO_HOLD     : out std_logic
+		-- Post-load CD hold: keep CPU, video and audio in step during replay.
+		SS_REPLAY_HOLD    : out std_logic
 	);
 end cd;
 
@@ -94,6 +94,7 @@ architecture rtl of cd is
 	signal SCSI_BSY_N			: std_logic;
 	signal SCSI_REQ_N			: std_logic;
 	signal SCSI_DATAIN_HELD	: std_logic;	-- staged DATAIN byte held during replay
+	signal SCSI_READ_HOLD    : std_logic;
 	signal SCSI_MSG_N			: std_logic;
 	signal SCSI_CD_N			: std_logic;
 	signal SCSI_IO_N			: std_logic;
@@ -148,7 +149,6 @@ architecture rtl of cd is
 	signal ADPCM_READ_PEND	: std_logic;
 	signal PLAY_READ_PEND	: std_logic;
 	signal DMA_WRITE_PEND	: std_logic := '0';
-	signal DMA_STAGED			: std_logic := '0';	-- staged DATAIN byte owned by DMA
 	signal ADPCM_WRITE_NIB	: std_logic;
 	signal ADPCM_READ_NIB	: std_logic;
 	signal WRITE_PEND			: std_logic;
@@ -304,7 +304,6 @@ begin
 			ADPCM_CTRL <= (others => '0');
 			ADPCM_DMA_EN <= '0';
 			ADPCM_DMA_RUN <= '0';
-			DMA_STAGED <= '0';
 			ADPCM_END <= '0';
 			ADPCM_HALF <= '0';
 			ADPCM_PLAY <= '0';
@@ -319,13 +318,6 @@ begin
 			M5205_D <= (others => '0');
 		elsif rising_edge( CLK ) then
 			if SaveStateBus_load = '1' then
-				-- DMA stores the byte before completing ACK; the CPU consumes
-				-- it on its register read. Preserve ownership from the saved
-				-- DMA/ACK state before replay clears the live handshake.
-				DMA_STAGED <= (SS_V(1)(55) or SS_V(1)(56))          -- DMA_EN / DMA_RUN
-				              and (SS_V(1)(63)                       -- DMA_WRITE_PEND
-				                   or SS_V(0)(21)                    -- AUTO_ACK
-				                   or not SS_V(0)(8));               -- ACK asserted
 				-- Savestate restore (registers driven by this process)
 				SCSI_DBI      <= SS_V(0)(7 downto 0);
 				SCSI_ACK_N    <= SS_V(0)(8);
@@ -707,8 +699,11 @@ begin
 	
 	SEL_N <= not (REG_SEL and EN);
 	-- Sector readers may consume $1808 without polling between bytes.
-	-- Stall the CPU until the restored stream is ready, not the CD replay.
-	CPU_WAIT_N <= not SCSI_DATAIN_HELD;
+	-- Wait only data reads; status polling and ACK writes must stay available.
+	CPU_WAIT_N <= '0' when EN = '1' and SCSI_DATAIN_HELD = '1'
+	                    and REG_SEL = '1' and EXT_RD_N = '0'
+	                    and (EXT_A(7 downto 0) = x"08" or EXT_A(7 downto 0) = x"01")
+	              else '1';
 	-- Mask both data-ready status and IRQ while the staged byte is held.
 	IRQ_N <= not ((CD_DTR_EN and CD_DTR and not SCSI_DATAIN_HELD) or (CD_DTD_EN and CD_DTD) or (CD_SUBCD_EN and CD_SUBCD) or (ADPCM_END_EN and ADPCM_END) or (ADPCM_HALF_EN and ADPCM_HALF));
 	
@@ -758,8 +753,9 @@ begin
 		CD_WR			=> CD_DATA_WR,
 		CD_DATA_END	=> CD_DATA_END,
 		DATAIN_HELD	=> SCSI_DATAIN_HELD,
+		READ_HOLD       => SCSI_READ_HOLD,
 
-		SLEEP				=> SLEEP,
+		SLEEP             => WALK_SLEEP or (SLEEP and not SCSI_READ_HOLD),
 		DTD_EN			=> CD_DTD_EN,
 		SaveStateBus_Din  => SaveStateBus_Din,
 		SaveStateBus_Adr  => SaveStateBus_Adr,
@@ -771,7 +767,6 @@ begin
 		CDDA_CONSUMED	=> CDDA_CONSUMED,
 		AUDIO_CMD_SET	=> AUDIO_CMD_SET,
 		REPLAY_SKIP		=> REPLAY_SKIP,
-		DMA_STAGED		=> DMA_STAGED,
 		REPLAY_START	=> REPLAY_START,
 		REPLAY_CONSUMED => REPLAY_CONSUMED,
 		REPLAY_FAST => CD_FAST_SEEK,
@@ -883,16 +878,8 @@ begin
 	
 	MSM5205 : entity work.MSM5205
 	port map (
-		-- The decoder's reset is derived from ADPCM_PLAY, which is itself restored
-		-- state, and MSM5205 resets DEC_DATA/STEP/SAMPLE ASYNCHRONOUSLY - so the
-		-- async reset wins over the synchronous SS_load restore.  Loading a state
-		-- in which ADPCM was playing while the machine currently has PLAY=0 (the
-		-- ordinary case) therefore threw the restored decoder state away and
-		-- resumed from SAMPLE=0/STEP=0.  ADPCM is differential, so everything
-		-- after that point is wrong.  Holding the decoder out of reset for the
-		-- whole savestate walk (SLEEP) lets the restore land; once SLEEP drops,
-		-- the RESTORED ADPCM_PLAY governs again, so a state that was not playing
-		-- still ends up properly reset.
+		-- SLEEP holds the enabled decoder out of asynchronous reset so SS_load
+		-- can restore it. Restored ADPCM_PLAY/CTRL govern reset after the walk.
 		RST_N		=> ((not ADPCM_CTRL(7) and ADPCM_PLAY) or SLEEP) and EN,
 		CLK		=> CLK,
 		
@@ -1226,7 +1213,7 @@ begin
 		end if;
 	end process;
 
-	SS_AUDIO_HOLD <= AH;
+	SS_REPLAY_HOLD <= AH or SCSI_READ_HOLD;
 
 	--Fader
 	process( RST_N, CLK )
