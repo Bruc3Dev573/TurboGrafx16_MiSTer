@@ -84,6 +84,7 @@ entity pce_top is
 		SPR_EN		: in  std_logic;
 		GRID_EN		: in  std_logic_vector(1 downto 0);
 		CPU_PAUSE_EN: in  std_logic;
+		PAUSE			: in  std_logic := '0';						-- Pause button: hold the core as a savestate freeze does
 
 		-- Savestates (Robert Peip framework)
 		SS_SAVE		: in  std_logic := '0';						-- save request pulse (savestate_ui)
@@ -94,6 +95,7 @@ entity pce_top is
 		SS_ACTIVE_SLOT : out std_logic_vector(1 downto 0);
 		SS_ACTIVE_LOAD : out std_logic := '0';
 		SS_SLEEP		: out std_logic;								-- core frozen (for top-level muxes)
+		SS_LOADING	: out std_logic;								-- a load has passed the header check and holds the freeze
 		-- 64-bit DDR3 channel (wire to ddram ch1 in TurboGrafx16.sv)
 		SS_DDR_DIN	: out std_logic_vector(63 downto 0);
 		SS_DDR_DOUT	: in  std_logic_vector(63 downto 0) := (others => '0');
@@ -299,6 +301,8 @@ signal ss_bnd_idle       : std_logic;	-- CPU at STATE=0 with no pending reset
 signal video_vbl_i       : std_logic;
 signal ss_boundary       : std_logic;
 signal ss_frozen         : std_logic := '0';
+signal ss_hold_req       : std_logic;	-- engine request or Pause button
+signal ss_loading_i      : std_logic;
 signal ss_wd             : unsigned(27 downto 0) := (others => '0');
 signal ss_sleep_eff      : std_logic;
 signal ss_walk_sleep     : std_logic;	-- freeze, restore and refetch; exported as SS_SLEEP
@@ -1004,6 +1008,7 @@ PSG_SL <= signed(PCE_SL(23 downto 8));
 --------------------------------------------------------------------------------
 
 SS_SLEEP <= ss_walk_sleep;
+SS_LOADING <= ss_loading_i;
 SS_BUSY  <= ss_busy_i;
 SS_FAILED <= ss_save_failed;
 SS_ACTIVE_SLOT <= std_logic_vector(to_unsigned(ss_request_slot, 2));
@@ -1031,9 +1036,11 @@ ss_boundary <= '1' when ss_bnd_idle = '1' and CPU_CE = '0'
 
 -- Wait for the safe boundary before gating CEs and acknowledging the engine.
 -- After 2^27 clocks, force the freeze; a forced save aborts without writing.
+-- The Pause button takes the same freeze; a save while paused needs no new boundary.
+ss_hold_req <= sleep_ss or PAUSE;
 process( CLK ) begin
 	if rising_edge( CLK ) then
-		if sleep_ss = '0' then
+		if ss_hold_req = '0' then
 			ss_frozen <= '0';
 			ss_wd <= (others => '0');
 		elsif ss_frozen = '0' then
@@ -1044,7 +1051,7 @@ process( CLK ) begin
 				ss_forced <= ss_wd(27);	-- watchdog-forced (non-boundary) freeze
 			end if;
 		end if;
-		if sleep_ss = '0' then
+		if ss_hold_req = '0' then
 			ss_forced <= '0';
 		end if;
 		ss_paused <= ss_frozen;
@@ -1078,7 +1085,7 @@ ss_kick <= '1' when ss_refetch = '1' and ss_refetch_cnt(3 downto 0) = "1000" els
 -- SLEEP stays asserted seamlessly through restore (ss_load_done) and the
 -- ROM refetch window, so the restored registers are held until the fetch
 -- path is fresh.
-ss_walk_sleep <= (sleep_ss and ss_frozen) or ss_load_done or ss_refetch;
+ss_walk_sleep <= (ss_hold_req and ss_frozen) or ss_load_done or ss_refetch;
 -- CD replay holds CPU, video and audio together. Main must keep delivering.
 ss_sleep_eff <= ss_walk_sleep or ss_replay_hold;
 
@@ -1128,7 +1135,7 @@ port map (
 	BUS_wren              => SaveStateBus_wren,
 	BUS_rst               => SaveStateBus_rst,
 	BUS_Dout              => SaveStateBus_Dout,
-	loading_savestate     => open,
+	loading_savestate     => ss_loading_i,
 	saving_savestate      => ss_saving,
 	sleep_savestate       => sleep_ss,
 	Save_RAMAddr          => Save_RAMAddr,

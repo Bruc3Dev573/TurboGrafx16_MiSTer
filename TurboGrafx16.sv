@@ -45,7 +45,6 @@ assign LED_POWER = 0;
 assign BUTTONS   = osd_btn;
 assign VGA_SCALER  = 0;
 assign VGA_DISABLE = 0;
-assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
@@ -161,7 +160,7 @@ parameter CONF_STR = {
 	"Restore state 3,",
 	"Save to state 4,",
 	"Restore state 4;",
-	"J1,Button I,Button II,Select,Run,Button III,Button IV,Button V,Button VI,Savestates;",
+	"J1,Button I,Button II,Select,Run,Button III,Button IV,Button V,Button VI,Savestates,Pause;",
 	"jn,A,B,Select,Start,X,Y,L,R;",
 	"jp,A,B,Select,Start,L,R,Y,X;",
 	"V,v",`BUILD_DATE
@@ -207,7 +206,8 @@ pll pll
 wire [63:0] status;
 wire  [1:0] buttons;
 
-wire [12:0] joy_0, joy_1, joy_2, joy_3, joy_4;	// [12] = Savestates button (not visible to the game)
+wire [13:0] joy_0;	// [12] Savestates, [13] Pause (not visible to the game)
+wire [12:0] joy_1, joy_2, joy_3, joy_4;
 wire [15:0] joy_a, joy_b;
 wire  [7:0] pd_0;
 
@@ -301,6 +301,7 @@ wire [25:0] ss_ddr_adr;		// DWORD address from pce_top/savestates
 wire  [7:0] ss_ddr_be;
 wire        ss_ddr_rnw, ss_ddr_ena, ss_ddr_done;
 wire        ss_sleep;
+wire        ss_loading;
 
 wire  [1:0] ss_slot;
 wire  [7:0] ss_info;
@@ -403,6 +404,7 @@ pce_top #(.LITE(LITE)) pce_top
 	.SS_ACTIVE_SLOT(ss_active_slot),
 	.SS_ACTIVE_LOAD(ss_active_load),
 	.SS_SLEEP(ss_sleep),
+	.SS_LOADING(ss_loading),
 	.SS_DDR_DIN(ss_ddr_din),
 	.SS_DDR_DOUT(ss_ddr_dout),
 	.SS_DDR_ADDR(ss_ddr_adr),
@@ -487,6 +489,7 @@ pce_top #(.LITE(LITE)) pce_top
 	.SPR_EN(VDC_SPR_EN),
 	.GRID_EN(VDC_GRID_EN),
 	.CPU_PAUSE_EN(CPU_PAUSE_EN),
+	.PAUSE(btn_pause),
 
 	.ReducedVBL(~overscan),
 	.BORDER_EN(~status[15]),
@@ -726,6 +729,9 @@ video_mixer #(.LINE_LENGTH(560), .GAMMA(1)) video_mixer
 	.*,
 	.VGA_DE(vga_de),
 	.freeze_sync(),
+	// HDMI shows the scaler's last frame while paused (HDMI_FREEZE). The mixer's own
+	// freeze (black + sync) stays off.
+	.HDMI_FREEZE(1'b0),
 	.scandoubler(scale || forced_scandoubler),
 	.hq2x(scale==1)
 );
@@ -987,7 +993,46 @@ always @(posedge clk_sys) begin
 	if (joy_0[12]) ss_combo_tail <= 20'd530000;   // ~10 ms at 53.something MHz
 	else if (ss_combo_tail != 0) ss_combo_tail <= ss_combo_tail - 1'd1;
 end
-wire [12:0] joy_0_game = ss_combo_hold ? (joy_0 & ~13'h0FFF) : joy_0;
+wire [12:0] joy_0_game = ss_combo_hold ? (joy_0[12:0] & ~13'h0FFF) : joy_0[12:0];
+
+// Pause button, J1 bit 13. It holds the core through the savestate freeze, so the
+// pause starts at the next instruction boundary inside VBlank and stops the CPU, the
+// video, the PSG and the CD parts together; Main holds CD delivery as during a save.
+// A save keeps the pause. A load ends it once the engine holds the freeze, and reset
+// ends it.
+reg        btn_pause = 0;
+reg        pause_load = 0;
+reg [15:0] pause_load_to = 0;
+always @(posedge clk_sys) begin : pausekey
+	reg old_state;
+	old_state <= joy_0[13];
+	if (reset | cart_download) begin
+		btn_pause  <= 0;
+		pause_load <= 0;
+	end
+	else if (pause_load) begin
+		if (ss_busy) pause_load_to <= '1;   // a load may still be queued behind a save
+		else pause_load_to <= pause_load_to - 1'd1;
+		if (ss_loading) begin btn_pause <= 0; pause_load <= 0; end
+		else if (~ss_busy & ~|pause_load_to) pause_load <= 0;   // the load did not start
+	end
+	else if (btn_pause & ss_load) begin
+		pause_load    <= 1;
+		pause_load_to <= '1;
+	end
+	else if (~old_state & joy_0[13]) btn_pause <= ~btn_pause;
+end
+
+// The video counters stop with the core, so HDMI keeps the last complete frame until
+// the first VBlank after the core runs again.
+reg pause_vid = 0;
+always @(posedge clk_sys) begin : pausevid
+	reg old_vbl;
+	old_vbl <= vbl;
+	if (btn_pause) pause_vid <= 1;
+	else if (~ss_sleep & vbl & ~old_vbl) pause_vid <= 0;
+end
+assign HDMI_FREEZE = pause_vid;
 
 wire [15:0] joy_data;
 always_comb begin
