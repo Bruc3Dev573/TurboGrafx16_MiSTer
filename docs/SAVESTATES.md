@@ -120,10 +120,14 @@ the phase of its clock-enable dividers so the VDCs restart in step.
 
 RAM regions use existing second ports (WRAM, VRAM, PRAM, palette, SAT,
 waveforms) or borrow the CPU port while frozen (backup RAM). CD work RAM and
-Arcade RAM live in SDRAM behind one port. `rtl/ss_external_ram.vhd` drives
-that port byte by byte from the walk, only while frozen, and paces the engine
-with `Save_RAMRdy`. `rtl/ddram.sv` adds a direct 64-bit channel to DDR3 for
-the slot itself, outside the ROM cache.
+Arcade RAM share the external memory port (SDRAM or DDR-backed).
+`rtl/ss_external_ram.vhd` drives it byte by byte while frozen. If the port is
+not ready on the 256th wait clock, the engine fails the operation instead of
+consuming the byte. It withdraws the request and keeps the port until any
+outstanding access drains. A save that times out leaves the slot header invalid. A
+failed restore resets the console before releasing it: reset does not undo
+RAM writes already made. If the hardware never drains, reload the core.
+The slot itself uses a separate 64-bit DDR3 channel outside the ROM cache.
 After a stopped reference clock restarts, the SDRAM controller waits for
 refresh recovery before issuing ACTIVE. At 85.9 MHz this takes six clocks.
 
@@ -241,7 +245,8 @@ programs and disc models: no BIOS or game image is needed.
 |`bash sim/run_sdram_restart.sh`|SDRAM restart phases, refresh recovery, byte/word writes and consecutive reads|
 |`bash sim/run_cd_subcode_resume.sh`|CDDA/subcode resume, delayed FIFO data, in-flight burst, persistent backlog|
 |`bash sim/run_cd_audio_hold.sh`|Post-load audio hold: resume, abandon, no hold, watchdog, fast-seek bit|
-|`bash sim/run_arcade_memory.sh`|Arcade RAM roundtrip through the engine and shared bridge|
+|`bash sim/run_arcade_memory.sh`|Short and full CD/Arcade RAM roundtrips through the engine and shared bridge|
+|`bash sim/run_arcade_memory.sh --faults`|Last-cycle acknowledgement, failed save, reset after a partial load, drain and retry|
 |`bash sim/run_arcade_snapshot.sh`|Arcade registers with the production savestate registers|
 
 These are source-level checks, not a substitute for hardware testing.
