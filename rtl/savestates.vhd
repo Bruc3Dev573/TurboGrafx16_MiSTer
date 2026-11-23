@@ -68,7 +68,8 @@ entity savestates is
       bus_out_rnw             : out    std_logic := '0';
       bus_out_ena             : out    std_logic := '0';
       bus_out_be              : out    std_logic_vector(7 downto 0) := (others => '0');
-      bus_out_done            : in     std_logic
+      bus_out_done            : in     std_logic;
+      Save_RAMError           : in     std_logic := '0'  -- sticky; Save_RAMRdy then means the port has drained
    );
 end entity;
 
@@ -141,7 +142,9 @@ architecture arch of savestates is
       LOADMEMORY_NEXT,
       LOADMEMORY_READ,
       LOADMEMORY_WRITE,
-      LOAD_APPLY
+      LOAD_APPLY,
+      WALK_DRAIN_SLOT,
+      WALK_DRAIN_RAM
    );
    signal state : tstate := IDLE;
    signal load_committed : std_logic := '0';
@@ -165,7 +168,8 @@ begin
    arcade_loaded <= transaction_arcade;
    loading_savestate <= load_committed;
    reset_requested <= reset_in or reset_latched;
-   reset_delay <= reset_requested and not load_committed;
+   -- Defer external reset during a restore, but reset a faulted console while still frozen.
+   reset_delay <= Save_RAMError when load_committed = '1' else reset_requested;
 
 
    process (clk)
@@ -176,6 +180,20 @@ begin
          sleep_savestate  <= '0';
          saving_savestate <= '0';
          save_failed      <= '1';
+      end procedure;
+      procedure fail_walk is
+      begin
+         save_failed  <= '1';
+         Save_RAMRdEn <= '0';
+         Save_RAMWrEn <= '0';
+         reset_ss     <= load_committed;
+         BUS_rst      <= load_committed;
+         -- A slot fetch can overlap the previous byte write. Never let its response reach a retry.
+         if (state = LOADMEMORY_READ or state = SAVEMEMORY_WRITE) and bus_out_done /= '1' then
+            state <= WALK_DRAIN_SLOT;
+         else
+            state <= WALK_DRAIN_RAM;
+         end if;
       end procedure;
    begin
       if rising_edge(clk) then
@@ -303,7 +321,9 @@ begin
                end if;
 
             when SAVEMEMORY_NEXT =>
-               if reset_requested = '1' then
+               if Save_RAMError = '1' then
+                  fail_walk;
+               elsif reset_requested = '1' then
                   reject_request;
                elsif (savetype_counter < ARCADE_SAVETYPE or
                       (savetype_counter = ARCADE_SAVETYPE and transaction_arcade = '1')) then
@@ -339,7 +359,9 @@ begin
                end if;
 
             when SAVEMEMORY_READ =>
-               if (memory_slow = 7 and Save_RAMRdy = '1') then
+               if Save_RAMError = '1' then
+                  fail_walk;
+               elsif (memory_slow = 7 and Save_RAMRdy = '1') then
                   bus_out_Din(bytecounter * 8 + 7 downto bytecounter * 8) <= Save_RAMReadData;
                   if (bytecounter < 7) then
                      bytecounter    <= bytecounter + 1;
@@ -352,7 +374,9 @@ begin
                end if;
 
             when SAVEMEMORY_WRITE =>
-               if (bus_out_done = '1') then
+               if Save_RAMError = '1' then
+                  fail_walk;
+               elsif (bus_out_done = '1') then
                   bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
                   if reset_requested = '1' then
                      -- Drain the in-flight word; the slot size is still zero.
@@ -398,7 +422,7 @@ begin
 
             when LOAD_HEADERAMOUNTCHECK =>
                if (bus_out_done = '1') then
-                  -- Header acceptance commits the restore; never interrupt it afterward.
+                  -- Only a RAM walk fault can interrupt an accepted restore.
                   if (inhibit = '1' or reset_requested = '1') then
                      reject_request;
                   elsif (bus_out_Dout(63 downto 32) = std_logic_vector(to_unsigned(STATESIZE_FULL, 32)) or
@@ -445,7 +469,9 @@ begin
 
             when LOADMEMORY_NEXT =>
                -- Drain the final paced write before switching region or waking.
-               if (memory_slow = 7 and Save_RAMRdy = '1') then
+               if Save_RAMError = '1' then
+                  fail_walk;
+               elsif (memory_slow = 7 and Save_RAMRdy = '1') then
                   if (savetype_counter < ARCADE_SAVETYPE or
                       (savetype_counter = ARCADE_SAVETYPE and transaction_arcade = '1')) then
                      state          <= LOADMEMORY_READ;
@@ -462,12 +488,16 @@ begin
                end if;
 
             when LOADMEMORY_READ =>
-               if (bus_out_done = '1') then
+               if Save_RAMError = '1' then
+                  fail_walk;
+               elsif (bus_out_done = '1') then
                   state             <= LOADMEMORY_WRITE;
                end if;
 
             when LOADMEMORY_WRITE =>
-               if (memory_slow = 7 and Save_RAMRdy = '1') then
+               if Save_RAMError = '1' then
+                  fail_walk;
+               elsif (memory_slow = 7 and Save_RAMRdy = '1') then
                   RAMAddrNext                    <= std_logic_vector(unsigned(RAMAddrNext) + 1);
                   Save_RAMAddr                   <= RAMAddrNext;
                   Save_RAMWrEn                   <= '1';
@@ -496,6 +526,18 @@ begin
                load_committed    <= '0';
                sleep_savestate   <= '0';
                save_failed       <= reset_requested;
+
+            when WALK_DRAIN_SLOT =>
+               if bus_out_done = '1' then
+                  state <= WALK_DRAIN_RAM;
+               end if;
+
+            when WALK_DRAIN_RAM =>
+               -- Keep ownership and the address stable even if the physical port never recovers.
+               if Save_RAMRdy = '1' then
+                  load_committed <= '0';
+                  reject_request;
+               end if;
 
          end case;
 

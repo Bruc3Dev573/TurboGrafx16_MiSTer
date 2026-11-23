@@ -324,6 +324,7 @@ signal ss_cdr_wr         : std_logic;
 signal ss_cdr_kick       : std_logic;
 signal SS_Dout_AC        : std_logic_vector(63 downto 0);
 signal ss_ram_rdy        : std_logic;
+signal ss_ram_error      : std_logic;
 signal VRAM0_QB          : std_logic_vector(15 downto 0);
 signal VRAM1_QB          : std_logic_vector(15 downto 0);
 signal WRAM_QB           : std_logic_vector(7 downto 0);
@@ -968,6 +969,7 @@ port map (
 	region => Save_RAMType, walk_addr => Save_RAMAddr,
 	walk_wr => Save_RAMWrEn, walk_data => Save_RAMWriteData,
 	walk_q => ss_cdr_data, walk_ready => ss_ram_rdy, active => ss_cdr_act,
+	walk_error => ss_ram_error,
 	ram_addr => ss_cdr_addr, ram_data => ss_cdr_wdata, ram_q => CD_RAM_DI,
 	ram_ready => ROM_RDY, ram_rd => ss_cdr_rd, ram_wr => ss_cdr_wr,
 	kick => ss_cdr_kick
@@ -1138,6 +1140,7 @@ port map (
 	Save_RAMWriteData     => Save_RAMWriteData,
 	Save_RAMReadData      => Save_RAMReadData,
 	Save_RAMRdy           => ss_ram_rdy,
+	Save_RAMError         => ss_ram_error,
 	Save_RAMType          => Save_RAMType,
 	bus_out_Din           => SS_DDR_DIN,
 	bus_out_Dout          => SS_DDR_DOUT,

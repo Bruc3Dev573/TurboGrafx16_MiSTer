@@ -1,6 +1,7 @@
 #!/bin/bash
 # Short + full-size real-engine/shared-bridge roundtrips; GHDL mcode, no core/stub/ROM.
-# Usage from repository root: bash sim/run_arcade_memory.sh
+# Usage: bash sim/run_arcade_memory.sh [--faults] [GHDL run options]
+# --faults uses 16 CD bytes for the deadline, failed save/load and recovery cases.
 set -euo pipefail
 GHDL="${GHDL:-ghdl}"
 case "$("$GHDL" --version)" in
@@ -17,4 +18,8 @@ FLAGS=(--std=08 -frelaxed-rules -fexplicit --workdir=. -P.)
 "$GHDL" -a "${FLAGS[@]}" "$R/rtl/ss_external_ram.vhd"
 "$GHDL" -a "${FLAGS[@]}" "$R/sim/tb_arcade_memory.vhd"
 "$GHDL" -e "${FLAGS[@]}" tb_arcade_memory
+if [[ ${1:-} == --faults ]]; then
+    shift
+    set -- -gG_FAULTS=true -gCD_BYTES=16 "$@"
+fi
 "$GHDL" -r "${FLAGS[@]}" tb_arcade_memory --max-stack-alloc=0 --assert-level=error "$@"

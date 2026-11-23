@@ -18,7 +18,8 @@ entity ss_external_ram is
 		ram_q : in std_logic_vector(7 downto 0);
 		ram_ready : in std_logic;
 		ram_rd : buffer std_logic;
-		ram_wr, kick : out std_logic
+		ram_wr, kick : out std_logic;
+		walk_error : out std_logic
 	);
 end entity;
 
@@ -26,13 +27,16 @@ architecture rtl of ss_external_ram is
 	signal borrowing : std_logic;
 	signal count : unsigned(7 downto 0);
 	signal previous : std_logic_vector(24 downto 0);
-	signal busy, ready : std_logic;
+	signal busy, ready, failed : std_logic;
 begin
 	-- Neither the pending freeze request nor post-load refetch owns this port.
 	borrowing <= '1' when sleep_ss = '1' and frozen = '1' and
 	                         (region = 10 or region = 11) else '0';
 	active <= borrowing;
-	walk_ready <= ready when region = 10 or region = 11 else '1';
+	walk_error <= failed and borrowing;
+	-- After failure ready means the withdrawn request has drained, not a valid byte.
+	walk_ready <= '1' when region /= 10 and region /= 11 else
+	              ram_ready when failed = '1' else ready;
 
 	process(clk)
 	begin
@@ -44,18 +48,24 @@ begin
 				ram_wr <= '0';
 				busy <= '0';
 				ready <= '0';
-			else
+				failed <= '0';
+			elsif failed = '0' then
 				if busy = '1' then
 					count <= count + 1;
 					-- Reissue every 16 clocks regardless of ram_ready.
-					-- Sample when count >= 21 and ram_ready is high, or at timeout.
+					-- A response on the last allowed cycle still wins.
 					if count(3 downto 0) = "0010" then kick <= '1'; end if;
-					if count >= 21 and (ram_ready = '1' or count = 255) then
+					if count >= 21 and ram_ready = '1' then
 						if ram_rd = '1' then walk_q <= ram_q; end if;
 						ram_rd <= '0';
 						ram_wr <= '0';
 						busy <= '0';
 						ready <= '1';
+					elsif count = 255 then
+						ram_rd <= '0';
+						ram_wr <= '0';
+						busy <= '0';
+						failed <= '1';
 					end if;
 				elsif saving = '1' and walk_addr /= previous then
 					previous <= walk_addr;
