@@ -90,7 +90,7 @@ entity pce_top is
 		SS_LOAD		: in  std_logic := '0';						-- load request pulse
 		SS_SLOT		: in  std_logic_vector(1 downto 0) := "00";
 		SS_BUSY		: out std_logic;
-		SS_FAILED	: out std_logic;					-- save failed or load cancelled before restore
+		SS_FAILED	: out std_logic;
 		SS_ACTIVE_SLOT : out std_logic_vector(1 downto 0);
 		SS_ACTIVE_LOAD : out std_logic := '0';
 		SS_SLEEP		: out std_logic;								-- core frozen (for top-level muxes)
@@ -256,6 +256,7 @@ signal ss_paused         : std_logic := '0';
 signal ss_busy_i         : std_logic;
 signal ss_save_failed    : std_logic;
 signal ss_reset          : std_logic;
+signal ss_external_reset : std_logic;
 signal ss_load_done      : std_logic;
 signal ss_req_save       : std_logic;
 signal ss_req_load       : std_logic;
@@ -822,17 +823,17 @@ ROM_CLKEN <= CPU_CLKEN or ss_kick or ss_cdr_kick;	-- ss_kick: post-load refetch;
 
 process( CLK ) begin
 	if rising_edge( CLK ) then
-		if RESET = '1' or ss_reset = '1' then
-			-- T65-style reset-branch restore: on a plain reset SS_TOP holds the
-			-- eReg default ("00"); on a savestate load it holds the loaded value.
+		if ss_load_done = '1' then
 			rombank <= SS_TOP(1 downto 0);
+		elsif ss_external_reset = '1' then
+			rombank <= SSREG_DEFAULT_TOP(1 downto 0);
 		elsif CPU_CE = '1' then
 			-- CPU_A(12 downto 2) = X"7FC" means CPU_A & 0x1FFC = 0x1FF0
 			if CPU_A(20) = '0' and ('0' & CPU_A(12 downto 2)) = X"7FC" and CPU_WR_N = '0' then
 				rombank <= CPU_A(1 downto 0);
 			end if;
 		end if;
-		RESET_N <= not (RESET or ss_reset);
+		RESET_N <= not (ss_external_reset or ss_reset);
 	end if;
 end process;
 
@@ -1110,7 +1111,7 @@ port map (
 	clk                   => CLK,
 	reset_in              => RESET,
 	reset_ss              => ss_reset,
-	reset_delay           => open,
+	reset_delay           => ss_external_reset,
 	load_done             => ss_load_done,
 	arcade_used           => ss_ac_used_r,
 	arcade_loaded         => ss_arcade_loaded,
@@ -1175,7 +1176,7 @@ process( CLK ) begin
 	if rising_edge( CLK ) then
 		if ss_load_done = '1' then
 			ss_ac_used_r <= ss_arcade_loaded;
-		elsif RESET = '1' then
+		elsif ss_external_reset = '1' then
 			ss_ac_used_r <= '0';
 		elsif ss_sleep_eff = '0' and
 		      ((AC_SEL_N = '0' and CPU_WR_N = '0') or AC_RAM_CS_N = '0') then

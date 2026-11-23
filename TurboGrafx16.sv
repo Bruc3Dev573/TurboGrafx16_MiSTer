@@ -319,15 +319,8 @@ wire [63:0] ss_top_ext;
 reg rom_loaded = 0;
 always @(posedge clk_sys) if (cart_download) rom_loaded <= 1;
 
-// Enabled MB128 blocks immediately, before the session latch is clocked.
-wire ss_inhibit = mb128_ena | mb128_ss_blocked;
-
-// Arcade Card RAM and registers are included when the game has used the card.
-// bk_state also excludes the SAVE half: the backup RAM is a dual-port shared
-// with the HPS buffer, so a savestate walk running while the .sav streams out
-// would hand the host a half-restored image.
-wire ss_avail = (rom_loaded | cd_en) & ~bk_loading & ~bk_state
-              & ~ss_inhibit;
+wire ss_inhibit = mb128_ena | mb128_ss_blocked | bk_start | bk_state;
+wire ss_avail = (rom_loaded | cd_en) & ~ss_inhibit & ~(bk_want_load | bk_want_save);
 
 savestate_ui savestate_ui
 (
@@ -1312,10 +1305,21 @@ wire bk_load    = status[16];
 wire bk_save    = status[7] | (bk_pending & OSD_STATUS && status[23]);
 reg  bk_loading = 0;
 reg  bk_state   = 0;
+reg  old_load = 0, old_save = 0;
+
+wire bk_mount_load = old_downloading & ~downloading;
+wire bk_request = bk_ena & (bk_mount_load | (~old_load & bk_load) | (~old_save & bk_save));
+wire bk_request_load = bk_mount_load | bk_load;
+
+reg bk_wait_load = 0, bk_wait_save = 0, bk_load_first = 0;
+wire bk_want_load = bk_wait_load | (bk_request & bk_request_load);
+wire bk_want_save = bk_wait_save | (bk_request & ~bk_request_load);
+wire bk_start = ~bk_state & ~ss_busy & ~downloading & (bk_want_load | bk_want_save);
+wire bk_next_load = bk_want_load & (~bk_want_save | bk_load_first);
 
 always @(posedge clk_sys) begin
 	reg old_format;
-	reg old_load = 0, old_save = 0, old_ack;
+	reg old_ack;
 	reg mb128sz;
 
 	old_load <= bk_load;
@@ -1324,34 +1328,32 @@ always @(posedge clk_sys) begin
 
 	if(~old_ack & sd_ack) {sd_rd, sd_wr} <= 0;
 
-	if(!bk_state) begin
-		if(bk_ena & ((~old_load & bk_load) | (~old_save & bk_save))) begin
-			bk_state <= 1;
-			bk_loading <= bk_load;
-			mb128sz <= bk_load || (mb128_ena && mb128_dirty);
+	if (downloading) begin
+		bk_wait_load <= 0;
+		bk_wait_save <= 0;
+	end else if (!bk_state) begin
+		bk_wait_load <= bk_want_load & ~(bk_start & bk_next_load);
+		bk_wait_save <= bk_want_save & ~(bk_start & ~bk_next_load);
+		if (bk_start) bk_load_first <= ~bk_next_load;
+		else if (!bk_wait_load && !bk_wait_save) bk_load_first <= bk_request_load;
+	end
+
+	if (bk_start) begin
+		bk_state <= 1;
+		bk_loading <= bk_next_load;
+		mb128sz <= bk_next_load || (mb128_ena && mb128_dirty);
+		sd_lba <= 0;
+		sd_rd <=  bk_next_load;
+		sd_wr <= ~bk_next_load;
+	end else if (bk_state && old_ack && !sd_ack) begin
+		if(sd_lba[8] == mb128sz && &sd_lba[1:0]) begin
+			bk_loading <= 0;
+			bk_state <= 0;
 			sd_lba <= 0;
-			sd_rd <=  bk_load;
-			sd_wr <= ~bk_load;
-		end
-		if(old_downloading & ~downloading & bk_ena) begin
-			bk_state <= 1;
-			bk_loading <= 1;
-			mb128sz <= 1;
-			sd_lba <= 0;
-			sd_rd <= 1;
-			sd_wr <= 0;
-		end
-	end else begin
-		if(old_ack & ~sd_ack) begin
-			if(sd_lba[8] == mb128sz && &sd_lba[1:0]) begin
-				bk_loading <= 0;
-				bk_state <= 0;
-				sd_lba <= 0;
-			end else begin
-				sd_lba <= sd_lba + 1'd1;
-				sd_rd  <=  bk_loading;
-				sd_wr  <= ~bk_loading;
-			end
+		end else begin
+			sd_lba <= sd_lba + 1'd1;
+			sd_rd  <=  bk_loading;
+			sd_wr  <= ~bk_loading;
 		end
 	end
 
