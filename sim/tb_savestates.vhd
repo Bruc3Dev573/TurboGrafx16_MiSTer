@@ -10,6 +10,8 @@
 --   * LOAD roundtrip: eReg value restored, memory bytes reproduced exactly,
 --     reset_ss pulsed, load_done pulsed
 --   * LOAD reject: corrupted STATESIZE header -> no reset_ss, no load_done
+--   * Main sees one counter change at final publication, using the destination
+--     slot's counter even after loading another slot or wrapping FFFFFFFF
 --   * Savestates to SDCard off: no header write moves the change counter,
 --     even when the DDR grants it late; the slot still loads byte-exact
 --
@@ -100,8 +102,9 @@ architecture sim of tb_savestates is
 	signal corrupt_header : std_logic := '0';
 	signal main_prefetch : std_logic := '0';
 	signal saved_count : unsigned(31 downto 0) := (others => '0');
+	signal publish_count  : integer := 0;                        -- file copies triggered by Main
 	signal wr_count       : integer := 0;                        -- DDR words written (save)
-	signal rd_count       : integer := 0;                        -- DDR words read (load)
+	signal rd_count       : integer := 0;                        -- DDR reads (including save header fetch)
 	signal first_wr_adr   : integer := -1;
 	signal ctrl_written   : std_logic := '0';
 	type cnt_t is array (0 to 15) of integer;
@@ -241,37 +244,52 @@ begin
 		end if;
 	end process;
 
-	-- DDR3 model: 1-cycle latency, word storage indexed relative to SLOT_BASE.
+	-- DDR3 model: keep the short-format image for each of two adjacent slots.
 	-- Like ddram.sv, a write stores the data and byte enables present at its
 	-- grant; late_grant delays header-write grants, as DDR contention can.
 	ddr_model : process(clk)
-		type mem_t is array (0 to 16#C0000# / 2 - 1) of std_logic_vector(63 downto 0);
-		variable mem   : mem_t;
-		variable idx   : integer;
+		type slot_image_t is array (0 to EXP_STATESIZE / 2 - 1) of std_logic_vector(63 downto 0);
+		type mem_t is array (SLOT to SLOT + 1) of slot_image_t;
+		variable mem : mem_t := (others => (0 => x"00000000FFFFFFFF", others => (others => 'U')));
+		variable base, idx : integer;
+		variable body_words : integer := -1; -- -1 outside the invalid-to-valid interval
 		variable a     : integer;
 		variable pend  : std_logic := '0';
 		variable wpend : integer := 0;	-- clocks until a delayed header write is granted
 
 		procedure store(i : integer; adr : integer) is
-			variable w : std_logic_vector(63 downto 0) := mem(i);
+			variable w : std_logic_vector(63 downto 0) := mem(req_slot)(i);
 		begin
 			for b in 0 to 7 loop
 				if ddr_be(b) = '1' then w(8 * b + 7 downto 8 * b) := ddr_din(8 * b + 7 downto 8 * b); end if;
 			end loop;
 			wr_count <= wr_count + 1;
 			if first_wr_adr = -1 then first_wr_adr <= adr; end if;
-			if adr /= SLOT_BASE then
+			if i /= 0 then
+				assert body_words >= 0 report "payload written with valid header" severity failure;
+				body_words := body_words + 1;
 				assert ddr_be = x"FF" report "unexpected byte-enable on save write" severity failure;
 			else
-				-- Main copies a slot to SD when this counter changes (process_ss).
-				assert to_sd = '1' or w(31 downto 0) = mem(i)(31 downto 0)
-					report "change counter moved with Savestates to SDCard off" severity failure;
+				-- Poll after every DDR grant that can change the header, including mid-save.
+				if w(31 downto 0) /= mem(req_slot)(0)(31 downto 0) then
+					assert w(63 downto 32) = std_logic_vector(to_unsigned(EXP_STATESIZE, 32))
+						and body_words = EXP_SAVE_WRITES - 2
+						report "Main saw a changed counter before the file was complete" severity failure;
+					assert to_sd = '1' report "Main saw a change with SD off" severity failure;
+					publish_count <= publish_count + 1;
+				end if;
 				if w(63 downto 32) = x"00000000" then
-					-- header-invalidate at save start: slot must be
-					-- rejectable while the body is being written
+					assert body_words = -1 and ddr_be = x"F0"
+						report "invalidation must write only the size DWORD, before the body" severity failure;
+					body_words := 0;
 					assert ctrl_written = '0'
 						report "header invalidate AFTER control word" severity failure;
 				else
+					assert body_words = EXP_SAVE_WRITES - 2
+						report "valid header published before all payload words" severity failure;
+					assert (to_sd = '0' and ddr_be = x"F0") or (to_sd = '1' and ddr_be = x"FF")
+						report "incorrect final header byte enables" severity failure;
+					body_words := -1;
 					ctrl_written <= '1';
 					saved_count <= unsigned(w(31 downto 0));
 					assert to_integer(unsigned(w(63 downto 32))) = EXP_STATESIZE
@@ -280,7 +298,7 @@ begin
 							& " expected " & integer'image(EXP_STATESIZE) severity failure;
 				end if;
 			end if;
-			mem(i) := w;
+			mem(req_slot)(i) := w;
 		end procedure;
 	begin
 		if rising_edge(clk) then
@@ -288,16 +306,17 @@ begin
 			-- Reset the control-word ordering check for each attempt.
 			if clr_flags = '1' then ctrl_written <= '0'; end if;
 			-- Main marks prefetched SD slots with this change-counter sentinel.
-			if main_prefetch = '1' then mem(0)(31 downto 0) := x"FFFFFFFF"; end if;
+			if main_prefetch = '1' then mem(SLOT + 1)(0)(31 downto 0) := x"FFFFFFFF"; end if;
 			if ddr_ena = '1' then
-				assert wpend = 0 report "DDR request while a write awaits its grant" severity failure;
+				assert wpend = 0 and pend = '0' report "DDR request before preceding grant" severity failure;
 				a   := to_integer(unsigned(ddr_adr));
-				assert a >= SLOT_BASE and a < SLOT_BASE + 16#C0000#
+				base := SLOT_BASE + (req_slot - SLOT) * 16#C0000#;
+				assert req_slot >= SLOT and a >= base and a < base + EXP_STATESIZE
 					report "DDR access outside slot window: " & integer'image(a) severity failure;
 				assert (a mod 2) = 0 report "DDR address not word-aligned" severity failure;
-				idx := (a - SLOT_BASE) / 2;
+				idx := (a - base) / 2;
 				if ddr_rnw = '0' then
-					if a = SLOT_BASE and late_grant = '1' then
+					if idx = 0 and late_grant = '1' then
 						wpend := 4;
 					else
 						store(idx, a);
@@ -305,12 +324,12 @@ begin
 					end if;
 				else
 					if idx = 0 and corrupt_header = '1' then
-						ddr_dout <= std_logic_vector(to_unsigned(EXP_STATESIZE + 2, 32)) & mem(0)(31 downto 0);
+						ddr_dout <= std_logic_vector(to_unsigned(EXP_STATESIZE + 2, 32)) & mem(req_slot)(0)(31 downto 0);
 					else
-						ddr_dout <= mem(idx);
+						ddr_dout <= mem(req_slot)(idx);
 					end if;
 					rd_count <= rd_count + 1;
-					if a = SLOT_BASE and hold_header = '1' then
+					if idx = 0 and hold_header = '1' then
 						pend := '1';
 					else
 						ddr_done <= '1';
@@ -319,7 +338,7 @@ begin
 			elsif wpend > 0 then
 				wpend := wpend - 1;
 				if wpend = 0 then
-					store(0, SLOT_BASE);
+					store(idx, a);
 					ddr_done <= '1';
 				end if;
 			elsif pend = '1' and hold_header = '0' then
@@ -332,6 +351,7 @@ begin
 	stim : process
 		variable wr_before : integer := 0;
 		variable rd_before : integer := 0;
+		variable published_before : integer;
 		variable regions_before : cnt_t;
 		procedure pulse(signal button : out std_logic) is begin
 			button <= '1';
@@ -362,6 +382,8 @@ begin
 			report "save word count " & integer'image(wr_count)
 				& " expected " & integer'image(EXP_SAVE_WRITES) severity failure;
 		assert ctrl_written = '1' report "control word never written" severity failure;
+		assert saved_count = 0 and publish_count = 1
+			report "first save did not publish FFFFFFFF -> 0 exactly once" severity failure;
 		report "TB: SAVE ok (" & integer'image(wr_count) & " words)";
 
 		----------------------------------------------------------------
@@ -533,6 +555,7 @@ begin
 		-- Once a transfer is committed, finish it rather than leave a torn slot
 		-- or a partly restored machine. The inhibit blocks following requests.
 		report "TB: MB128 mode change during committed save/load";
+		selected_slot <= SLOT + 1;
 		live_reg <= x"C0DEC0DEC0DEC0DE";
 		clr_flags <= '1'; wait_cycles(2); clr_flags <= '0';
 		wr_before := wr_count;
@@ -553,8 +576,8 @@ begin
 			report "inhibit interrupted a committed restore" severity failure;
 		report "TB: MB128 policy PASS (queue, boundary, settle, header, committed transfer)";
 
-		-- Loading a prefetched SD slot imports FFFFFFFF. The next complete
-		-- save wraps to zero; size, not the change counter, validates a load.
+		-- Main prefetches and then loads slot 3 (FFFFFFFF). Slot 2 still has
+		-- its first valid save (counter 0); another save there must publish 1.
 		inhibit <= '0';
 		main_prefetch <= '1'; wait_cycles(2); main_prefetch <= '0';
 		clr_flags <= '1'; wait_cycles(2); clr_flags <= '0';
@@ -563,14 +586,27 @@ begin
 		assert saw_load_done = '1' and reg_out = x"C0DEC0DEC0DEC0DE"
 			report "Main-prefetched slot failed to restore" severity failure;
 
-		for expected_count in 0 to 1 loop
+		for expected_count in 1 downto 0 loop
+			if expected_count = 1 then selected_slot <= SLOT; else selected_slot <= SLOT + 1; end if;
+			late_grant <= '1'; hold_header <= '1';
 			live_reg <= x"123456789ABCDEF0";
 			clr_flags <= '1'; wait_cycles(2); clr_flags <= '0';
 			wr_before := wr_count;
+			rd_before := rd_count; published_before := publish_count;
 			pulse(save_btn);
-			wait until sleep_ss = '1'; wait until sleep_ss = '0'; wait_cycles(10);
+			wait until rd_count > rd_before or wr_count > wr_before;
+			assert rd_count = rd_before + 1 and to_integer(unsigned(ddr_adr)) = req_addr
+				report "first save access was not a destination header read" severity failure;
+			wait_cycles(6);
+			assert wr_count = wr_before report "slot modified before its header read completed" severity failure;
+			hold_header <= '0';
+			wait until wr_count > wr_before + 1; -- invalidated and writing payload
+			assert publish_count = published_before report "Main copied a partial file" severity failure;
+			wait until sleep_ss = '0'; wait_cycles(10);
+			assert rd_count = rd_before + 1 and publish_count = published_before + 1
+				report "save must read its destination and trigger exactly one file copy" severity failure;
 			assert saved_count = to_unsigned(expected_count, 32)
-				report "unexpected counter after Main-prefetched load" severity failure;
+				report "save counter did not advance from the destination header" severity failure;
 			assert ctrl_written = '1' and save_failed = '0'
 				and wr_count - wr_before = EXP_SAVE_WRITES
 				report "counter-wrap save did not complete the payload" severity failure;
@@ -591,15 +627,19 @@ begin
 		-- move (the model checks every header write, granted late here), and
 		-- the slot must still load.
 		report "TB: Savestates to SDCard off";
-		to_sd <= '0'; late_grant <= '1';
+		selected_slot <= SLOT; -- counter 1: a torn low DWORD would be observable
+		to_sd <= '0';
 		live_reg <= x"5D0FF5D0FF5D0FF0";
 		clr_flags <= '1'; wait_cycles(2); clr_flags <= '0';
 		wr_before := wr_count;
+		published_before := publish_count;
 		pulse(save_btn);
 		wait until sleep_ss = '1'; wait until sleep_ss = '0'; wait_cycles(10);
 		assert ctrl_written = '1' and save_failed = '0'
 			and wr_count - wr_before = EXP_SAVE_WRITES
 			report "SD-off save did not complete the payload" severity failure;
+		assert saved_count = 1 and publish_count = published_before
+			report "SD-off save changed the slot counter or published a file" severity failure;
 		live_reg <= (others => '0');
 		clr_flags <= '1'; wait_cycles(2); clr_flags <= '0';
 		pulse(load_btn);

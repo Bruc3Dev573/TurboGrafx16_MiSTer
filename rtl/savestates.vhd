@@ -25,7 +25,7 @@ entity savestates is
       clk                     : in     std_logic;
       reset_in                : in     std_logic;
       reset_ss                : out    std_logic := '0';
-      reset_delay             : out    std_logic := '0';
+      reset_delay             : out    std_logic := '0'; -- external reset for the live core, deferred across a committed load
 
       load_done               : out    std_logic := '0';
       arcade_used             : in     std_logic := '0';
@@ -38,8 +38,8 @@ entity savestates is
       load                    : in     std_logic;
       savestate_address       : in     integer;
       savestate_busy          : out    std_logic;
-      -- Suppress UI completion for a failed save or a load cancelled before
-      -- restoring anything. Held until the next accepted request.
+      -- Suppress UI completion for a failed save, refused load or a load
+      -- superseded by external reset. Held until the next accepted request.
       save_failed             : out    std_logic := '0';
 
       paused                  : in     std_logic;
@@ -124,6 +124,7 @@ architecture arch of savestates is
    (
       IDLE,
       SAVE_WAITSETTLE,
+      SAVEREADHDR,
       SAVECLEARHDR,
       SAVECLEARHDR_WRITE,
       SAVEINTERNALS_WAIT,
@@ -139,9 +140,13 @@ architecture arch of savestates is
       LOADMEMORY_RESET,
       LOADMEMORY_NEXT,
       LOADMEMORY_READ,
-      LOADMEMORY_WRITE
+      LOADMEMORY_WRITE,
+      LOAD_APPLY
    );
    signal state : tstate := IDLE;
+   signal load_committed : std_logic := '0';
+   signal reset_latched  : std_logic := '0';
+   signal reset_requested : std_logic;
 
    signal count               : integer range 0 to MAXSIZEMEM := 0;
    signal maxcount            : integer range 0 to MAXSIZEMEM;
@@ -152,19 +157,26 @@ architecture arch of savestates is
    signal RAMAddrNext         : std_logic_vector(24 downto 0) := (others => '0');
    signal memory_slow         : unsigned(2 downto 0) := (others => '0');
 
-   signal header_amount       : unsigned(31 downto 0) := to_unsigned(1, 32);
-   -- Header byte enables. With increaseSSHeaderCount = '0' header writes skip
-   -- the change counter (low word): Main copies a slot to SD only when that
-   -- counter changes, so the slot stays in memory.
-   signal hdr_be              : std_logic_vector(7 downto 0);
+   signal next_header_count   : unsigned(31 downto 0);
 
 begin
 
    savestate_busy <= '0' when state = IDLE else '1';
    arcade_loaded <= transaction_arcade;
-   hdr_be <= x"FF" when increaseSSHeaderCount = '1' else x"F0";
+   loading_savestate <= load_committed;
+   reset_requested <= reset_in or reset_latched;
+   reset_delay <= reset_requested and not load_committed;
+
 
    process (clk)
+      variable header_read_vetoed : boolean;
+      procedure reject_request is
+      begin
+         state            <= IDLE;
+         sleep_savestate  <= '0';
+         saving_savestate <= '0';
+         save_failed      <= '1';
+      end procedure;
    begin
       if rising_edge(clk) then
 
@@ -172,10 +184,13 @@ begin
          BUS_wren      <= '0';
          BUS_rst       <= '0';
          reset_ss      <= '0';
-         reset_delay   <= '0';
          load_done     <= '0';
 
-         bus_out_be    <= x"FF";
+         if state = IDLE then
+            reset_latched <= '0';
+         elsif reset_in = '1' then
+            reset_latched <= '1';
+         end if;
 
          memory_slow <= memory_slow + 1;
          if (memory_slow = 6) then
@@ -186,18 +201,17 @@ begin
          case state is
 
             when IDLE =>
+               bus_out_be <= x"FF";
                savetype_counter <= 0;
                -- No RAM region owns the port during settle/header transfers.
                Save_RAMType <= (others => '1');
-               if (reset_in = '1') then
-                  reset_delay <= '1';
+               if (reset_requested = '1') then
                   reset_ss    <= '1';
                   BUS_rst     <= '1';
                elsif (save = '1' and inhibit = '0') then
                   state                <= SAVE_WAITSETTLE;
                   settle               <= 0;
                   sleep_savestate      <= '1';
-                  header_amount        <= header_amount + 1;
                   save_failed          <= '0';
                elsif (load = '1' and inhibit = '0') then
                   state                <= LOAD_WAITSETTLE;
@@ -212,10 +226,8 @@ begin
             -- #################
 
             when SAVE_WAITSETTLE =>
-               if (inhibit = '1') then
-                  state           <= IDLE;
-                  sleep_savestate <= '0';
-                  save_failed     <= '1';
+               if (inhibit = '1' or reset_requested = '1') then
+                  reject_request;
                elsif (paused = '0') then
                   settle <= 0;
                elsif (settle < SETTLECOUNT) then
@@ -223,52 +235,59 @@ begin
                elsif (save_abort = '1') then
                   -- A forced boundary cannot produce a restorable save.
                   -- Reject before invalidating the existing slot.
-                  state           <= IDLE;
-                  sleep_savestate <= '0';
-                  save_failed     <= '1';
+                  reject_request;
                else
                   -- Sample only once, after the running core has frozen and settled.
                   transaction_arcade <= arcade_used;
-                  -- invalidate the slot header FIRST: an aborted or torn save
-                  -- must leave a rejectable slot, never a stale valid header
-                  -- in front of an inconsistent body
-                  state            <= SAVECLEARHDR;
+                  -- Main may have replaced this slot since the previous operation.
+                  state            <= SAVEREADHDR;
                   bus_out_Adr      <= std_logic_vector(to_unsigned(savestate_address, 26));
-                  bus_out_rnw      <= '0';
+                  bus_out_rnw      <= '1';
+                  bus_out_ena      <= '1';
+                  header_read_vetoed := false;
                   BUS_adr          <= (others => '0');
                   count            <= 1;
                   saving_savestate <= '1';
                end if;
 
+            when SAVEREADHDR =>
+               -- Drain the outstanding read even if the save is vetoed.
+               if inhibit = '1' or save_abort = '1' then
+                  header_read_vetoed := true;
+               end if;
+               if bus_out_done = '1' then
+                  next_header_count <= unsigned(bus_out_Dout(31 downto 0)) + 1;
+                  state <= SAVECLEARHDR;
+               end if;
+
             when SAVECLEARHDR =>
-               -- Last veto before the first destructive write; then finish atomically.
-               if (inhibit = '1') then
-                  state            <= IDLE;
-                  sleep_savestate  <= '0';
-                  saving_savestate <= '0';
-                  save_failed      <= '1';
+               -- A veto here still preserves the previous slot.
+               if (header_read_vetoed or inhibit = '1' or save_abort = '1' or reset_requested = '1') then
+                  reject_request;
                else
-                  -- The load gate reads only the size word, so clearing it
-                  -- invalidates the slot even when the counter is kept.
+                  -- Only the final publish may change the counter Main watches.
+                  bus_out_rnw    <= '0';
                   bus_out_Din    <= (others => '0');
-                  bus_out_be     <= hdr_be;
+                  bus_out_be     <= x"F0";
                   bus_out_ena    <= '1';
                   state          <= SAVECLEARHDR_WRITE;
                end if;
 
             when SAVECLEARHDR_WRITE =>
-               -- ddram latches data and byte enables at the grant, which can
-               -- come after the request: hold them until it completes.
-               bus_out_be <= hdr_be;
                if (bus_out_done = '1') then
                   state       <= SAVEINTERNALS_WAIT;
                   bus_out_Adr <= std_logic_vector(to_unsigned(savestate_address + HEADERCOUNT, 26));
                end if;
 
             when SAVEINTERNALS_WAIT =>
-               bus_out_Din    <= BUS_Dout;
-               bus_out_ena    <= '1';
-               state          <= SAVEINTERNALS_WRITE;
+               if reset_requested = '1' then
+                  reject_request;
+               else
+                  bus_out_be     <= x"FF";
+                  bus_out_Din    <= BUS_Dout;
+                  bus_out_ena    <= '1';
+                  state          <= SAVEINTERNALS_WRITE;
+               end if;
 
             when SAVEINTERNALS_WRITE =>
                if (bus_out_done = '1') then
@@ -284,8 +303,10 @@ begin
                end if;
 
             when SAVEMEMORY_NEXT =>
-               if (savetype_counter < ARCADE_SAVETYPE or
-                   (savetype_counter = ARCADE_SAVETYPE and transaction_arcade = '1')) then
+               if reset_requested = '1' then
+                  reject_request;
+               elsif (savetype_counter < ARCADE_SAVETYPE or
+                      (savetype_counter = ARCADE_SAVETYPE and transaction_arcade = '1')) then
                   state          <= SAVEMEMORY_READ;
                   bytecounter    <= 0;
                   count          <= 8;
@@ -295,21 +316,26 @@ begin
                   memory_slow    <= (others => '0');
                   Save_RAMType   <= to_unsigned(savetype_counter, 4);
                else
-                  state          <= SAVESIZEAMOUNT;
                   bus_out_Adr    <= std_logic_vector(to_unsigned(savestate_address, 26));
                   if transaction_arcade = '1' then
-                     bus_out_Din <= std_logic_vector(to_unsigned(STATESIZE_FULL, 32)) & std_logic_vector(header_amount);
+                     bus_out_Din <= std_logic_vector(to_unsigned(STATESIZE_FULL, 32)) & std_logic_vector(next_header_count);
                   else
-                     bus_out_Din <= std_logic_vector(to_unsigned(STATESIZE_SHORT, 32)) & std_logic_vector(header_amount);
+                     bus_out_Din <= std_logic_vector(to_unsigned(STATESIZE_SHORT, 32)) & std_logic_vector(next_header_count);
                   end if;
                   -- Publish the valid header only if the save completed.
                   if (save_abort = '0') then
+                     state <= SAVESIZEAMOUNT;
+                     -- Hold this mask with the data until DDR grants the write.
+                     if increaseSSHeaderCount = '1' then
+                        bus_out_be <= x"FF";
+                     else
+                        bus_out_be <= x"F0";
+                     end if;
                      bus_out_ena <= '1';
                   else
                      -- A late abort leaves the cleared header invalid.
-                     save_failed <= '1';
+                     reject_request;
                   end if;
-                  bus_out_be <= hdr_be;
                end if;
 
             when SAVEMEMORY_READ =>
@@ -328,7 +354,10 @@ begin
             when SAVEMEMORY_WRITE =>
                if (bus_out_done = '1') then
                   bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
-                  if (count < maxcount) then
+                  if reset_requested = '1' then
+                     -- Drain the in-flight word; the slot size is still zero.
+                     reject_request;
+                  elsif (count < maxcount) then
                      state        <= SAVEMEMORY_READ;
                      bytecounter  <= 0;
                      count        <= count + 8;
@@ -342,8 +371,7 @@ begin
                end if;
 
             when SAVESIZEAMOUNT =>
-               bus_out_be <= hdr_be;
-               if (bus_out_done = '1' or save_abort = '1') then
+               if (bus_out_done = '1') then
                   state            <= IDLE;
                   saving_savestate <= '0';
                   sleep_savestate  <= '0';
@@ -355,10 +383,8 @@ begin
             -- #################
 
             when LOAD_WAITSETTLE =>
-               if (inhibit = '1') then
-                  state           <= IDLE;
-                  sleep_savestate <= '0';
-                  save_failed     <= '1';
+               if (inhibit = '1' or reset_requested = '1') then
+                  reject_request;
                elsif (paused = '0') then
                   settle <= 0;
                elsif (settle < SETTLECOUNT) then
@@ -373,10 +399,8 @@ begin
             when LOAD_HEADERAMOUNTCHECK =>
                if (bus_out_done = '1') then
                   -- Header acceptance commits the restore; never interrupt it afterward.
-                  if (inhibit = '1') then
-                     state           <= IDLE;
-                     sleep_savestate <= '0';
-                     save_failed     <= '1';
+                  if (inhibit = '1' or reset_requested = '1') then
+                     reject_request;
                   elsif (bus_out_Dout(63 downto 32) = std_logic_vector(to_unsigned(STATESIZE_FULL, 32)) or
                       bus_out_Dout(63 downto 32) = std_logic_vector(to_unsigned(STATESIZE_SHORT, 32))) then
                      -- The slot, never the current session, selects the load walk.
@@ -385,17 +409,14 @@ begin
                      else
                         transaction_arcade <= '0';
                      end if;
-                     header_amount        <= unsigned(bus_out_Dout(31 downto 0));
                      state                <= LOADINTERNALS_READ;
                      bus_out_Adr          <= std_logic_vector(to_unsigned(savestate_address + HEADERCOUNT, 26));
                      bus_out_ena          <= '1';
                      BUS_adr              <= (others => '0');
                      count                <= 1;
-                     loading_savestate    <= '1';
+                     load_committed       <= '1';
                   else
-                     state                <= IDLE;
-                     sleep_savestate      <= '0';
-                     save_failed          <= '1';
+                     reject_request;
                   end if;
                end if;
 
@@ -435,10 +456,8 @@ begin
                      bus_out_ena    <= '1';
                      Save_RAMType   <= to_unsigned(savetype_counter, 4);
                   else
-                     state             <= IDLE;
-                     loading_savestate <= '0';
-                     sleep_savestate   <= '0';
-                     load_done         <= '1';
+                     state     <= LOAD_APPLY;
+                     load_done <= '1';
                   end if;
                end if;
 
@@ -469,6 +488,14 @@ begin
                      end if;
                   end if;
                end if;
+
+            when LOAD_APPLY =>
+               -- The live registers sample load_done on this edge, before
+               -- a queued reset reaches them or the UI samples the result.
+               state             <= IDLE;
+               load_committed    <= '0';
+               sleep_savestate   <= '0';
+               save_failed       <= reset_requested;
 
          end case;
 

@@ -67,10 +67,11 @@ other cores. `rtl/savestate_ui.sv` turns keyboard, pad and OSD actions into
 save and load pulses. It reports the completion of the operation that ran,
 not of the last key pressed. `rtl/statemanager.vhd` keeps one pending request
 per type together with its slot. It dispatches saves before loads and holds
-the slot address stable until the engine is busy. The UI is offered only with
-a game or disc loaded and no backup RAM transfer in flight. Enabling MB128
-vetoes requests at the engine. The veto stays latched until the next
-cartridge or core load, because the MB128 RAM is not captured.
+the slot address stable until the engine is busy. A native backup RAM transfer
+that has already started wins; savestate requests wait. Native load and save
+requests arriving during a savestate are retained and run afterward, one per
+direction in arrival order. Enabling MB128 vetoes savestate requests until the
+next cartridge or core load, because the MB128 RAM is not captured.
 
 ### Freeze
 
@@ -94,10 +95,10 @@ backup RAM, PSG waveforms, ADPCM DRAM, the 256 KiB CD work RAM and the 2 MiB
 Arcade RAM. The Arcade RAM is written only when the game has used the card.
 The two sizes are `0x20532` and `0xA0532` DWORDs. A load accepts nothing else.
 It picks the format from the header, not from the running game, and it
-restores the Arcade flag with it. The save clears the header before the first
-write and rewrites it after the last write, so an interrupted save leaves a
-slot that the load rejects. The save skips the counter word when
-`Savestates to SDCard` is off, and Main then does not copy the slot.
+restores the Arcade flag with it. Before writing the payload, a save clears
+only the size, so a load rejects an incomplete slot. After the last write it
+publishes the valid size and, if `Savestates to SDCard` is on, increments
+the destination slot's counter. Main sees a change only when the slot is ready.
 
 `rtl/bus_savestates.vhd` gives every module a shadow register per address.
 The live value is read during a save. The loaded value is parked and the
