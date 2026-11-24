@@ -147,6 +147,12 @@ through that seek. The CD unit holds the whole machine asleep until the saved
 sample heads the CDDA FIFO, so audio and picture resume on the same clock. A
 2^26-clock watchdog releases the hold.
 
+When a loop resumes after its first sector, the drive's seek target is no
+longer the original loop start. At the first wrap the core holds the last
+audio sample while it repositions the drive. Position queries do not cancel
+this correction; a new play, pause or READ6 command supersedes it. A busy
+mailbox can extend the hold, so the first wrap is not guaranteed gapless.
+
 An active READ6 also holds the machine during its initial replay drain.
 The restored DATAIN byte stays staged, including an ADPCM DMA byte whose ACK
 has not finished. During any active READ6, a CPU read of `$1808` or `$1801`
