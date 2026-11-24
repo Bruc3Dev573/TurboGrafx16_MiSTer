@@ -139,11 +139,12 @@ CDDA and subcode FIFOs are not saved. After a load SCSI replays the drive
 state to Main through the ordinary mailbox, one command per status. It resets
 the drive, runs the TOC queries it needs, restarts play at the saved position
 (sector address plus a sample skip within the sector, loop end restored),
-reissues any open READ6 and drains the bytes the game had already consumed,
-then reissues any pending query. It discards the statuses the replay itself
-produces and delivers the ones the game still waits for. Replayed play
-commands set the fast-seek bit, except when the game was itself waiting
-through that seek. The CD unit holds the whole machine asleep until the saved
+reissues any open READ6 and drains the bytes the game had already consumed.
+A query still waiting for data is reissued to rebuild its unsaved FIFO. If
+STATUS or MSGIN was already presented, the game finishes that saved handshake
+instead. Replay-only statuses are discarded. Replayed play commands use fast
+seek unless the game was itself waiting for that seek.
+The CD unit holds the whole machine asleep until the saved
 sample heads the CDDA FIFO, so audio and picture resume on the same clock. A
 2^26-clock watchdog releases the hold.
 
@@ -158,8 +159,8 @@ The restored DATAIN byte stays staged, including an ADPCM DMA byte whose ACK
 has not finished. During any active READ6, a CPU read of `$1808` or `$1801`
 waits if the next DATAIN byte is not ready. Status polling and other CPU
 accesses remain available, and video, audio and sector delivery continue.
-Final GOOD waits for queued DATAIN to drain; a failed READ closes without
-waiting for more data.
+For READ6 and queries, final GOOD waits until queued DATAIN is consumed.
+A failed command can report its status without waiting for more data.
 
 `rtl/hps_ext.v` reports the savestate walk to Main as bit 8 of `CD_GET`.
 It does not report the post-load replay hold: Main must feed that replay.
@@ -250,7 +251,7 @@ programs and disc models: no BIOS or game image is needed.
 |`bash sim/run_tb_cd_blind.sh`|Real CPU copying READ6 data to VRAM without per-byte REQ polling, with fresh mid-sector gaps before and after load|
 |`bash sim/run_sdram_restart.sh`|SDRAM restart phases, refresh recovery, byte/word writes and consecutive reads|
 |`bash sim/run_cd_subcode_resume.sh`|CDDA/subcode resume, delayed FIFO data, in-flight burst, persistent backlog|
-|`bash sim/run_cd_audio_hold.sh`|Post-load audio hold: resume, abandon, no hold, watchdog, fast-seek bit|
+|`bash sim/run_cd_audio_hold.sh`|Post-load audio hold, fast-seek bit, and sample-exact loop repair across SUBQ data, STATUS and MSGIN|
 |`bash sim/run_arcade_memory.sh`|Short and full CD/Arcade RAM roundtrips through the engine and shared bridge|
 |`bash sim/run_arcade_memory.sh --faults`|Last-cycle acknowledgement, failed save, reset after a partial load, drain and retry|
 |`bash sim/run_arcade_snapshot.sh`|Arcade registers with the production savestate registers|

@@ -263,6 +263,7 @@ begin
     snapshot(SSREG_INDEX_SCSI_1)(31 downto 24) := x"02";
    elsif G_CASE = 8 then
     snapshot(SSREG_INDEX_SCSI_1)(3 downto 0) := x"7"; -- SP_MSGIN_START
+    snapshot(SSREG_INDEX_SCSI_1)(31 downto 24) := x"04"; -- distinguish the saved message from private GOOD/00
    elsif G_CASE = 9 then
     snapshot(SSREG_INDEX_SCSI_1)(3 downto 0) := x"A"; -- SP_DATAIN_START, A3 staged
     snapshot(SSREG_INDEX_SCSI_1)(6 downto 5) := "11";
@@ -362,7 +363,8 @@ begin
    elsif G_CASE = 7 then
     take(x"D8", x"02");
    end if;
-   take(x"F8", x"00"); message_acked <= true;
+   if G_CASE = 8 then take(x"F8", x"04"); else take(x"F8", x"00"); end if;
+   message_acked <= true;
    expect_cmd(x"D8", "corrective D8");
    assert command(47 downto 24) = x"A00F00" and command(15 downto 8) = x"00" and cmd_fast = '1'
     report "SUBQ wrap: wrong corrective seek" severity failure;
