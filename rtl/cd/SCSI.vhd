@@ -152,7 +152,7 @@ architecture rtl of SCSI is
 	signal READ_ACTIVE   : std_logic;
 	signal READ_RESUME   : std_logic := '0';
 	-- a query command ($DD READ SUBQ, $DE CD_DINFO, ...) is outstanding
-	signal QRY_ACTIVE    : std_logic;
+	signal QRY_ACTIVE, QRY_REPLAY : std_logic;
 	-- The HPS mailbox holds one command; wait for status before reusing it.
 	signal CMD_OUTST     : std_logic := '0';
 	signal CMD_SEND_D    : std_logic := '0';
@@ -498,6 +498,20 @@ begin
 				DOUT_PEND <= '1';
 			end if;
 			
+			-- The flushed query FIFO is about to be rebuilt. Its replacement
+			-- response supplies its own STATUS, even if GOOD arrived in the walk.
+			if RP = RP_QRY_ISSUE then
+				STAT_PEND <= '0';
+				STAT_COUNT <= (others => '0');
+				SAVED_RESPONSE <= '0';
+			end if;
+			-- The replay sequencer runs during audio prefill: latch its prefix
+			-- on the issue strobe, even when SLEEP still holds the bus phases.
+			if RP_RSKIP_SET = '1' then
+				READ_SKIP <= RP_RSKIP;
+				RSKIP_GAP <= '0';
+			end if;
+
 			if SLEEP = '0' then
 
 			COMM_OUT <= '0';
@@ -512,11 +526,8 @@ begin
 				CD_Nr <= '1';
 				IO_Nr <= '1';
 				REQ_Nr <= '1';
-			else
-				if RP_RSKIP_SET = '1' then
-					READ_SKIP <= RP_RSKIP;
-					RSKIP_GAP <= '0';
-				elsif READ_SKIP /= 0
+			elsif RP_RSKIP_SET = '0' then
+				if READ_SKIP /= 0
 				   and not (STAT_GET = '1' and STAT_GET_D = '0' and STATUS /= x"00") then
 					-- Post-replay drain: discard the already-consumed head of the
 					-- re-issued stream. A seek delay must not cancel the byte debt.
@@ -556,7 +567,10 @@ begin
 							SP <= SP_COMM_BEFOREREQ;
 							DELAY_COUNT <= to_unsigned(1700, DELAY_COUNT'LENGTH);		-- Wait 40 microseconds after control signals are set up, before triggering REQ in COMMAND phase
 							DATAIN_CNT <= (others => '0');
-						elsif STAT_PEND = '1' and (READ_ACTIVE = '0' or EMPTY = '1') then
+						-- Main sends GOOD immediately after uploading query data. If
+						-- both arrived during SLEEP, expose the payload before GOOD.
+						elsif STAT_PEND = '1' and (EMPTY = '1' or
+						      (READ_ACTIVE = '0' and (QRY_ACTIVE = '0' or STATUS /= x"00"))) then
 							STAT_COUNT <= STAT_COUNT + 1;
 
 							if (STAT_COUNT = 45000) then		-- CLK is 42.95 MHz; this gives ~1.05 millisec delay before transitioning to STATUS phase
@@ -822,6 +836,9 @@ begin
 	REPLAY_RESUME <= RP_RESUME_r;
 	REPLAY_SKIP <= RP_SKIP;
 	REPLAY_CONSUMED <= RP_CONS - resize(RP_SKIP, 32);
+	-- Once STATUS or MSGIN has been presented, the saved handshake owns
+	-- the rest of the transaction. Main owes no second query response.
+	QRY_REPLAY <= '0' when SP >= SP_STAT_START and SP <= SP_MSGIN_HOLD else QRY_ACTIVE;
 	LF_DUE <= '1' when LF_ARM = '1' and CDDA_CONSUMED = LF_TARGET else '0';
 	-- SCSI may be SP_FREE while Main still owes a query's data or status.
 	-- Rondo can instead leave its completed D9 parked at STATUS indefinitely.
@@ -1250,7 +1267,7 @@ begin
 					if D9_SEEN = '1' or LF_REPLAY = '1' then
 						RP_DELAY <= RP_T_GAP;
 						RP <= RP_GAP;
-					elsif QRY_ACTIVE = '1' then
+					elsif QRY_REPLAY = '1' then
 						RP <= RP_QRY_PREP;
 					else
 						RP <= RP_IDLE;
@@ -1306,7 +1323,7 @@ begin
 						RP_SW_INC <= '1';
 					end if;
 					RP_DEBT_SW <= '0';	-- applies only to this replayed pair
-					if QRY_ACTIVE = '1' then
+					if QRY_REPLAY = '1' then
 						RP <= RP_QRY_PREP;
 					else
 						RP <= RP_IDLE;
@@ -1405,7 +1422,7 @@ begin
 						RP_SW_INC <= '1';	-- PAUSE answers with an immediate status
 					end if;
 					RP_FIFO_HOLD <= '0';
-					if QRY_ACTIVE = '1' then
+					if QRY_REPLAY = '1' then
 						RP <= RP_QRY_PREP;
 					else
 						RP <= RP_IDLE;

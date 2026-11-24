@@ -1,7 +1,7 @@
 #!/bin/bash
 # Post-load audio hold at the CD unit: resume, abandon, no-hold, watchdog,
 # and the replay D8 fast-seek bit (slow only for a D8 the game still awaited).
-#   sim/run_cd_audio_hold.sh [cases]   (default "0:60 0:1 1:60 3:0 4:60 5:60 6:60 2:60")
+#   sim/run_cd_audio_hold.sh [cases]   (e.g. "7:2923 8:2923 9:2923 10:2923 11:0" for SUBQ)
 # Each case is G_CASE:G_SKIP; case 6 simulates ~0.35 s, case 2 (watchdog) ~0.7 s.
 set -euo pipefail
 GHDL="$(command -v ghdl || true)"
@@ -17,7 +17,7 @@ for f in rtl/bus_savestates.vhd rtl/pce_savestates_pkg.vhd rtl/dpram.vhd rtl/CEG
     "$GHDL" -a "${FLAGS[@]}" "$R/$f"
 done
 "$GHDL" -e "${FLAGS[@]}" tb_cd_audio_hold
-for pair in ${1:-0:60 0:1 1:60 3:0 4:60 5:60 6:60 2:60}; do
+for pair in ${1:-0:60 0:1 1:60 3:0 4:60 5:60 6:60 2:60 7:2923 8:2923 9:2923 10:2923 11:0}; do
     echo "=== case ${pair%:*} skip ${pair#*:} $(date -u +%T)"
     "$GHDL" -r "${FLAGS[@]}" tb_cd_audio_hold -gG_CASE="${pair%:*}" -gG_SKIP="${pair#*:}" --max-stack-alloc=0 --ieee-asserts=disable --assert-level=error
 done

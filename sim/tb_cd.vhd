@@ -1578,9 +1578,6 @@ begin
 		-- insufficient: FIFO empty can also occur partway through a sector.
 		alias rd_cons_hw is << signal .tb_cd.DUT.CD.SCSI.READ_CONSUMED : unsigned(20 downto 0) >>;
 		alias rd_skip_hw is << signal .tb_cd.DUT.CD.SCSI.READ_SKIP : unsigned(11 downto 0) >>;
-		-- every DATAIN handshake, whatever the command: how the $DD answer is
-		-- paced on consumption rather than on the push
-		alias din_cnt_hw is << signal .tb_cd.DUT.CD.SCSI.DATAIN_CNT : unsigned(15 downto 0) >>;
 		variable pushed    : integer := 0;	-- bytes handed to the FIFO this command
 		variable total     : integer := 0;	-- bytes the command will deliver
 		-- Rebase READ_CONSUMED at first push: replay preserves its saved count.
@@ -1591,10 +1588,6 @@ begin
 		variable removed   : integer := 0;
 		variable dd_pend   : boolean := false;	-- $DD accepted, answer owed
 		variable dd_wait   : integer := 0;		-- ticks left before answering it
-		-- Gate $DD STATUS on consumption of all 10 bytes. SP_FREE prioritizes
-		-- STAT_PEND over FIFO data; early status would strand unread bytes.
-		variable dd_stat   : boolean := false;	-- data sent, STATUS owed
-		variable dd_target : integer := 0;		-- DATAIN_CNT that means "all 10 taken"
 		variable frame_val : integer;
 		variable t_next    : time;
 		-- Match CEGen's sample rate; mailbox polling does not pace CDDA.
@@ -1625,7 +1618,7 @@ begin
 				pend_stat := false; stat_wait := 0;
 				rd_stat := false; rd_wait := 0;
 				rdcnt := 0; pushed := 0; total := 0; removed := 0;
-				dd_pend := false; dd_stat := false; dd_wait := 0;
+				dd_pend := false; dd_wait := 0;
 				rh_has := false; rh_lat := 0; rh_can := false;
 				rh_sect_cnt := 0; rh_stat_cnt := 267;
 				audio_next := now; play_lat := 0 ns; audio_burst := 2;
@@ -1867,14 +1860,14 @@ begin
 						if ss_sleep = '1' then
 							i_ans_frozen <= i_ans_frozen + 1;
 						end if;
-						-- STATUS only once the program has taken all ten bytes
-						dd_stat   := true;
-						dd_target := to_integer(din_cnt_hw) + 10;
+						-- Main's Update() sends GOOD immediately after SendData,
+						-- without waiting for CPU ACKs or replayed-prefix drains.
+						cd_stat <= x"00";
+						wait until rising_edge(clk);
+						cd_stat_get <= '1';
+						wait until rising_edge(clk);
+						cd_stat_get <= '0';
 					end if;
-				end if;
-				if dd_stat and to_integer(din_cnt_hw) >= dd_target then
-					dd_stat := false;
-					pend_stat := true; stat_wait := 1;
 				end if;
 
 				-- rebase at each command's first sector: whatever READ_CONSUMED and
