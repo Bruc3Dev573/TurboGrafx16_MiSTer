@@ -251,6 +251,7 @@ architecture rtl of cd is
 	signal REPLAY_SKIP   : unsigned(9 downto 0);
 	signal REPLAY_START  : std_logic;
 	signal REPLAY_CONSUMED : unsigned(31 downto 0);
+	signal LOOP_HOLD     : std_logic;
 	signal SKIP_LEFT     : unsigned(9 downto 0) := (others => '0');
 	signal SKIP_GAP      : std_logic := '0';	-- idle cycle after a skip read (FIFO_EMPTY is registered)
 	signal REPLAY_AUDIO  : std_logic;
@@ -769,6 +770,7 @@ begin
 		REPLAY_SKIP		=> REPLAY_SKIP,
 		REPLAY_START	=> REPLAY_START,
 		REPLAY_CONSUMED => REPLAY_CONSUMED,
+		LOOP_HOLD		=> LOOP_HOLD,
 		REPLAY_FAST => CD_FAST_SEEK,
 		REPLAY_AUDIO => REPLAY_AUDIO,
 		REPLAY_RESUME => REPLAY_RESUME
@@ -1074,7 +1076,7 @@ begin
 			elsif SUBCD_RESUME = '1' and SUBCD_FIFO_EMPTY = '1' then
 				-- Do not start the audible remainder ahead of its subcode.
 				SUBCD_CE <= '0';
-			elsif CDDA_CE = '1' and EN = '1' and SLEEP = '0' then	-- ~44.1kHz
+			elsif CDDA_CE = '1' and EN = '1' and SLEEP = '0' and LOOP_HOLD = '0' and FIFO_SCLR = '0' then	-- ~44.1kHz
 				CDDA_SAMPLE <= not CDDA_SAMPLE;
 				if FIFO_EMPTY = '0' then
 					FIFO_RD_REQ <= '1';
@@ -1145,7 +1147,8 @@ begin
 					-- Drop stale pops and count the replay drain back up to the
 					-- saved position, rather than adding its skip a second time.
 					CDDA_CONSUMED <= REPLAY_CONSUMED;
-				elsif FIFO_RD_REQ = '1' and SKIP_EN = '1' then
+				elsif FIFO_RD_REQ = '1' then
+					-- The registered pop completes even if SLEEP rose after it was issued.
 					CDDA_CONSUMED <= CDDA_CONSUMED + 1;
 				end if;
 				-- Leave an idle clock after each pop: FIFO_EMPTY is registered.

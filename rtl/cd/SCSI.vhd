@@ -63,6 +63,7 @@ entity SCSI is
 		REPLAY_SKIP			: out unsigned(9 downto 0);	-- samples to discard after replay
 		REPLAY_START		: out std_logic;	-- pulse: flush CDDA/SUBC FIFOs, arm the skip
 		REPLAY_CONSUMED	: out unsigned(31 downto 0) := (others => '0'); -- counter base before skip
+		LOOP_HOLD			: out std_logic := '0'; -- stop DAC/subcode at the first restored wrap, not the game
 		CD_RESET_DONE		: in std_logic := '0';
 		REPLAY_RESET		: out std_logic := '0';
 		READ_HOLD           : out std_logic;
@@ -162,7 +163,7 @@ architecture rtl of SCSI is
 	signal SWAL_AGE      : unsigned(27 downto 0);	-- wait time for pending replay statuses
 	signal STAT_GET_D    : std_logic := '0';	-- edge detect: one status per strobe
 	type Replay_t is ( RP_IDLE, RP_WAIT, RP_CVT_START, RP_DIV588, RP_CVT_END, RP_LOOPMOD,
-	                   RP_HOLDGAP, RP_ISSUE, RP_GAP, RP_ISSUE_D9, RP_LF_CALC,
+	                   RP_HOLDGAP, RP_ISSUE, RP_GAP, RP_ISSUE_D9,
 	                   RP_RD_PREP, RP_RD_ISSUE, RP_PAUSE,
 	                   RP_QRY_PREP, RP_QRY_ISSUE, RP_RESET_WAIT,
 	                   RP_TOC_ISSUE, RP_TOC_WAIT, RP_TOC_CHECK, RP_TOC_END );
@@ -215,7 +216,7 @@ architecture rtl of SCSI is
 	signal LF_ARM        : std_logic := '0';
 	signal LF_REPLAY     : std_logic := '0';
 	signal LF_TARGET     : unsigned(31 downto 0) := (others => '0');
-	signal LF_ACC        : unsigned(31 downto 0) := (others => '0');
+	signal LF_DUE, LF_START : std_logic;
 	signal LF_CNT        : unsigned(20 downto 0) := (others => '0');
 	signal RP_STWD       : unsigned(25 downto 0) := (others => '0');	-- status-serialization watchdog (bit25 = 0.78 s)
 	signal AUD_OPEN      : std_logic := '0';	-- audio-family command sent, its status not yet arrived
@@ -437,6 +438,11 @@ begin
 			if RP = RP_WAIT and RP_DELAY = RP_T_SETTLE - 1 then
 				SAVED_STATUS <= STATUS;
 				SAVED_MESSAGE <= MESSAGE;
+			elsif LF_REPLAY = '1' and RP = RP_ISSUE and SP = SP_STAT_START and SAVED_RESPONSE = '0' then
+				-- DBO already holds the game's STATUS; its MESSAGE must survive both private replies.
+				SAVED_STATUS <= DBO_r;
+				SAVED_MESSAGE <= MESSAGE;
+				SAVED_RESPONSE <= '1';
 			end if;
 			-- Runs during the freeze too: a status arriving mid-walk must not be
 			-- lost.  A swallow whose status never arrives ages out after 3.1 s.
@@ -530,7 +536,7 @@ begin
 					end if;
 				elsif RSKIP_GAP = '1' then
 					RSKIP_GAP <= '0';
-				elsif RP_FREEZE = '0' then
+				elsif RP_FREEZE = '0' or (LF_REPLAY = '1' and SP = SP_FREE and SEL_N = '0') then
 				case SP is
 					when SP_FREE =>
 						if SEL_N = '0' then
@@ -539,10 +545,8 @@ begin
 							READ_ACTIVE <= '0';
 							READ_RESUME <= '0';
 							QRY_ACTIVE <= '0';
-							-- A game selection retires all replay bookkeeping: a leftover
-							-- swallow could only eat the game's own next status.
-							SWALLOW  <= (others => '0');
-							SWAL_AGE <= (others => '0');
+							-- A one-shot SEL can arrive during loop repair: take ownership
+							-- now, but withhold the first REQ until the private statuses drain.
 							READ_SKIP    <= (others => '0');
 							RSKIP_GAP    <= '0';
 							BSY_Nr <= '0';
@@ -818,6 +822,17 @@ begin
 	REPLAY_RESUME <= RP_RESUME_r;
 	REPLAY_SKIP <= RP_SKIP;
 	REPLAY_CONSUMED <= RP_CONS - resize(RP_SKIP, 32);
+	LF_DUE <= '1' when LF_ARM = '1' and CDDA_CONSUMED = LF_TARGET else '0';
+	-- SCSI may be SP_FREE while Main still owes a query's data or status.
+	-- Rondo can instead leave its completed D9 parked at STATUS indefinitely.
+	LF_START <= '1' when LF_DUE = '1' and SLEEP = '0' and SEL_N = '1'
+	                    and COMM_OUT = '0' and RP_SEND = '0' and CMD_OUTST = '0'
+	                    and SWALLOW = 0 and RP_SW_INC = '0'
+	                    and STAT_GET = '0' and STAT_PEND = '0' and AUD_OPEN = '0' and QRY_ACTIVE = '0'
+	                    and ((SP = SP_FREE and BSY_Nr = '1') or
+	                         (SP = SP_STAT_START and ACK_N = '1' and (COMM(0) = x"D8" or COMM(0) = x"D9")))
+	            else '0';
+	LOOP_HOLD <= '1' when LF_DUE = '1' or (LF_REPLAY = '1' and RP /= RP_IDLE) else '0';
 	-- Replayed D8s reposition the drive without Main's physical-seek delay,
 	-- except the load replay (and its retry) of a D8 whose status the saved
 	-- game still awaits: that seek keeps the latency the game was waiting
@@ -830,7 +845,7 @@ begin
 	-- RP_WAIT settles restored registers and captures CDDA_CONSUMED.
 	-- RP_RESET_WAIT/TOC_* reset the drive and resolve track addresses.
 	-- RP_CVT_*/DIV588/LOOPMOD convert the resume position to LBA and sample skip.
-	-- RP_ISSUE/D9 restore audio; RP_LF_CALC restores its original loop target.
+	-- RP_HOLDGAP also computes the first wrap boundary before a PLAY-mode D8 can stream.
 	-- RP_RD_*/QRY_* reissue reads and queries, draining already-consumed bytes.
 	-- RP_PAUSE stops a stream with nothing left to resume.
 	-- Discard replay-only audio statuses; preserve responses still owed to the
@@ -869,6 +884,7 @@ begin
 			RP_AUD_DONE <= '0';
 			RP_RETRY_RUN <= '0';
 			LF_ARM <= '0';
+			LF_CNT <= (others => '0');
 			LF_REPLAY <= '0';
 			RP_DEBT_SW <= '0';
 			RP_D8_OWED <= '0';
@@ -884,7 +900,7 @@ begin
 			case RP is
 				when RP_IDLE =>
 					RP_COMM_OVR <= '0';
-					LF_REPLAY <= '0';
+					if SWALLOW = 0 and RP_SW_INC = '0' then LF_REPLAY <= '0'; end if;
 					RP_AUDIO <= '0';
 					-- The tail flag is stale once the drain is over (RP_RSKIP_SET:
 					-- READ_SKIP is not loaded yet on the first IDLE cycle).
@@ -895,21 +911,15 @@ begin
 					-- an idle bus, and an interrupt-mode track end still pending.
 					RP_RETRY_RUN <= '0';	-- back in IDLE: the retry pass is over
 					RP_SG_D <= STAT_GET;
-					-- The game's own commands always supersede a replayed one
-					if COMM_OUT = '1' or SEL_N = '0' then
-						if COMM_OUT = '1' then
-							RP_PRIVATE <= '0';
-							RP_TOC_FAILED <= '0';
-							RP_TOC_READY <= '0';
-							RP_FIFO_HOLD <= '0';
-						end if;
-						LF_ARM <= '0';
-					elsif LF_ARM = '1' and CDDA_CONSUMED >= LF_TARGET
-					   and STAT_PEND = '0'
-					   and (SP = SP_FREE or
-					        (SP = SP_STAT_START and ACK_N = '1' and AUD_OPEN = '0')) then
-						-- A presented, unacknowledged status can outlive the track.
-						-- Freeze that reply while repairing only the physical drive.
+					if COMM_OUT = '1' then
+						RP_PRIVATE <= '0';
+						RP_TOC_FAILED <= '0';
+						RP_TOC_READY <= '0';
+						RP_FIFO_HOLD <= '0';
+						-- SEL does not identify the command. Only a completed
+						-- READ6/D8/D9/PAUSE replaces the drive's playback state.
+						if QRY_ACTIVE = '0' then LF_ARM <= '0'; end if;
+					elsif LF_START = '1' then
 						LF_ARM <= '0';
 						LF_REPLAY <= '1';
 						RP_SKIP <= (others => '0');
@@ -954,6 +964,7 @@ begin
 						RP_AUD_DONE <= '0';
 						RP_RETRY_RUN <= '0';
 						LF_ARM <= '0';
+						LF_CNT <= (others => '0');
 						LF_REPLAY <= '0';
 						RP_RETRY_AGE <= (others => '0');
 					end if;
@@ -1173,20 +1184,32 @@ begin
 						RP_SECT <= RP_START_LBA + RP_SECT;	-- absolute resume LBA
 						RP_DELAY <= RP_T_GAP;
 						RP_AFTER <= RP_ISSUE;
+						if RP_SECT /= 0 and RP_LEN /= 0 and
+						   ((D9_SEEN = '1' and D9_B1(1 downto 0) = "01") or
+						    (D9_SEEN = '0' and AUDIO_MODE = "10" and AUDIO_B1 = "01")) then
+							LF_CNT <= resize(RP_LEN - RP_SECT, LF_CNT'length);
+							LF_TARGET <= RP_CONS - resize(RP_SKIP, 32);
+						end if;
 						RP <= RP_HOLDGAP;
 					end if;
 
 				when RP_HOLDGAP =>	-- absorb the tail of the pre-load live stream
+					if LF_CNT /= 0 then
+						LF_TARGET <= LF_TARGET + 588;
+						LF_CNT <= LF_CNT - 1;
+						if LF_CNT = 1 then LF_ARM <= '1'; end if;
+					end if;
 					if RP_DELAY = 0 then
 						-- Serialize on statuses: the single HPS status slot is overwritten
 						-- by the next command; RP_STWD(25) = 0.78 s if it never arrives.
-						if SWALLOW = 0 and (AUD_OPEN = '0' or RP_TOC_READY = '1') and CMD_OUTST = '0' then
+						if LF_CNT = 0 and SWALLOW = 0 and (AUD_OPEN = '0' or RP_TOC_READY = '1') and CMD_OUTST = '0' then
 							RP_STWD <= (others => '0');
 							RP <= RP_AFTER;
 						elsif RP_STWD(25) = '1' then
 							-- Abort replay after 0.78 s without status rather than
 							-- overwrite an outstanding drive command.
 							RP_STWD <= (others => '0');
+							if RP_AFTER = RP_ISSUE then LF_ARM <= '0'; end if;
 							RP <= RP_IDLE;
 						else
 							RP_STWD <= RP_STWD + 1;
@@ -1199,7 +1222,9 @@ begin
 					RP_AUD_DONE <= '1';	-- allow one retry of this audio pair
 					RP_COMM <= (others => '0');
 					RP_COMM(7 downto 0) <= x"D8";
-					RP_COMM(9 downto 8) <= AUDIO_B1;	-- byte1: original CDDA play mode
+					-- A repair first seeks silently: Main must finish its old burst
+					-- before the second command starts a known, frame-aligned stream.
+					if LF_REPLAY = '0' then RP_COMM(9 downto 8) <= AUDIO_B1; end if;
 					RP_COMM(31 downto 24) <= std_logic_vector(RP_SECT(23 downto 16));
 					RP_COMM(39 downto 32) <= std_logic_vector(RP_SECT(15 downto 8));
 					RP_COMM(47 downto 40) <= std_logic_vector(RP_SECT(7 downto 0));
@@ -1222,15 +1247,9 @@ begin
 						RP_SW_INC <= '1';	-- the D8 pends one status
 					end if;
 					RP_FIFO_HOLD <= '0';
-					if D9_SEEN = '1' then
+					if D9_SEEN = '1' or LF_REPLAY = '1' then
 						RP_DELAY <= RP_T_GAP;
 						RP <= RP_GAP;
-					elsif AUDIO_MODE = "10" and AUDIO_B1 = "01" and RP_LEN /= 0
-					      and RP_SECT > RP_START_LBA then
-						-- Without D9, Main loops D8 to the disc leadout.
-						LF_CNT <= resize(RP_LEN - (RP_SECT - RP_START_LBA), 21);
-						LF_ACC <= (others => '0');
-						RP <= RP_LF_CALC;
 					elsif QRY_ACTIVE = '1' then
 						RP <= RP_QRY_PREP;
 					else
@@ -1246,6 +1265,7 @@ begin
 							RP <= RP_ISSUE_D9;
 						elsif RP_STWD(25) = '1' then
 							RP_STWD <= (others => '0');
+							LF_ARM <= '0';
 							RP <= RP_IDLE;	-- no D9 while D8 remains unanswered
 						else
 							RP_STWD <= RP_STWD + 1;
@@ -1254,60 +1274,42 @@ begin
 						RP_DELAY <= RP_DELAY - 1;
 					end if;
 
-				when RP_ISSUE_D9 =>	-- re-issue the game's last SAPEP verbatim
-					RP_COMM <= (others => '0');
-					RP_COMM(7 downto 0) <= x"D9";
-					RP_COMM(15 downto 8) <= D9_B1;
-					RP_COMM(23 downto 16) <= D9_B2;
-					RP_COMM(31 downto 24) <= D9_B3;
-					RP_COMM(39 downto 32) <= D9_B4;
-					RP_COMM(47 downto 40) <= D9_B5;
-					RP_COMM(79 downto 72) <= D9_MODE & "000000";
+				when RP_ISSUE_D9 =>
+					if D9_SEEN = '1' then
+						RP_COMM <= (others => '0');
+						RP_COMM(7 downto 0) <= x"D9";
+						RP_COMM(15 downto 8) <= D9_B1;
+						RP_COMM(23 downto 16) <= D9_B2;
+						RP_COMM(31 downto 24) <= D9_B3;
+						RP_COMM(39 downto 32) <= D9_B4;
+						RP_COMM(47 downto 40) <= D9_B5;
+						RP_COMM(79 downto 72) <= D9_MODE & "000000";
+					else
+						-- D8-only loop to leadout: repeat the silent seek as PLAY.
+						RP_COMM(9 downto 8) <= AUDIO_B1;
+					end if;
 					RP_COMM_OVR <= '1';
 					RP_SEND <= '1';
 					RP_AUDIO <= '0';
 					-- A SILENT D8 streams nothing during the gap: flush and re-arm the
 					-- skip.  A PLAY-mode D8 has already consumed (part of) its skip.
-					if AUDIO_B1 = "00" then
+					if AUDIO_B1 = "00" or LF_REPLAY = '1' then
 						RP_START_r <= '1';
 						RP_RESUME_r <= RP_AUDIO;
 					end if;
 					-- Discard immediate D9 status and duplicate track-end status
 					-- marked by RP_DEBT_SW. Preserve status for an outstanding
 					-- game D9 or the retry pass.
-					if (D9_B1(1 downto 0) /= "10" or RP_DEBT_SW = '1')
+					if LF_REPLAY = '1' or ((D9_B1(1 downto 0) /= "10" or RP_DEBT_SW = '1')
 					   and not (AUD_OPEN = '1' and AUD_LAST = "01")
-					   and RP_RETRY_RUN = '0' then
+					   and RP_RETRY_RUN = '0') then
 						RP_SW_INC <= '1';
 					end if;
 					RP_DEBT_SW <= '0';	-- applies only to this replayed pair
-					-- Arm the loop repair: a looping track resumed past its start
-					-- point would inherit a wrong wrap target (see LF_ARM)
-					if D9_B1(1 downto 0) = "01" and RP_LEN /= 0
-					   and RP_SECT > RP_START_LBA then
-						LF_CNT <= resize(RP_LEN - (RP_SECT - RP_START_LBA), 21);
-						LF_ACC <= (others => '0');
-						RP <= RP_LF_CALC;
-					elsif QRY_ACTIVE = '1' then
+					if QRY_ACTIVE = '1' then
 						RP <= RP_QRY_PREP;
 					else
 						RP <= RP_IDLE;
-					end if;
-
-				when RP_LF_CALC =>	-- sectors-to-end -> samples-to-wrap (x588)
-					if LF_CNT /= 0 then
-						LF_ACC <= LF_ACC + 588;
-						LF_CNT <= LF_CNT - 1;
-					else
-						-- Keep the original lap count; remove the replayed sector's
-						-- skip, then add its remaining sectors through the loop end.
-						LF_TARGET <= RP_CONS - resize(RP_SKIP, 32) + LF_ACC;
-						LF_ARM <= '1';
-						if QRY_ACTIVE = '1' then
-							RP <= RP_QRY_PREP;
-						else
-							RP <= RP_IDLE;
-						end if;
 					end if;
 
 				when RP_RD_PREP =>	-- rebuild the in-flight READ6
@@ -1425,7 +1427,7 @@ begin
 
 	-- Held until the replay's statuses have been swallowed too: statuses carry
 	-- no identity, so a game command issued meanwhile would lose its own.
-	RP_FREEZE <= '0' when RP = RP_IDLE and SWALLOW = 0 else '1';
+	RP_FREEZE <= '0' when RP = RP_IDLE and SWALLOW = 0 and RP_SW_INC = '0' else '1';
 	
 	DOUT <= DATA_BUF(9) & DATA_BUF(8) & DATA_BUF(7) & DATA_BUF(6) & DATA_BUF(5) & DATA_BUF(4) & DATA_BUF(3) & DATA_BUF(2) & DATA_BUF(1) & DATA_BUF(0);
 	DOUT_SEND <= DATA_OUT;
@@ -1552,8 +1554,8 @@ begin
 	-- An active READ6 can be reconstructed even with unread FIFO data.
 	-- Otherwise require no pending status/data-out request and an empty FIFO.
 	-- The phase and handshake registers are saved, so SP need not be SP_FREE.
-	SS_QUIET <= '1' when RP = RP_IDLE and READ_SKIP = 0 and SWALLOW = 0
-	                 and AUD_OPEN = '0'
+	SS_QUIET <= '1' when RP = RP_IDLE and READ_SKIP = 0 and SWALLOW = 0 and RP_SW_INC = '0'
+	                 and AUD_OPEN = '0' and LF_START = '0'
 	                 and ( READ_ACTIVE = '1'
 	                    or (STAT_PEND = '0' and DOUT_PEND = '0'
 	                        and EMPTY = '1') )

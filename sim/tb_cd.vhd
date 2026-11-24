@@ -1254,17 +1254,16 @@ architecture sim of tb_cd is
 	signal frz_cdda_drop : integer := 0;	-- CDDA samples lost while frozen
 	signal frz_subc_drop : integer := 0;	-- subcode bytes lost while frozen
 
-	-- Sample-tape index at the last CDDA flush. Anchor B/G to a flush:
-	-- a looping track eventually reaches any value, even after a bad resume.
-	signal flush_mark : integer := -1;
-	-- Silent D8/D9 flushes at RP_ISSUE and RP_ISSUE_D9. Each load's
-	-- resume anchor is its second flush; the wrap anchor is its fourth.
-	type flushlog_t is array (0 to 7) of integer;
-	signal flush_log : flushlog_t := (others => -1);
-	-- RP_CONS identifies the load owning each flush. A previous load's late
-	-- wrap pair can fall after this load's mark, so ordinal alone is unsafe.
-	signal flush_cons : flushlog_t := (others => -1);
-	signal flush_n   : integer := 0;
+	-- D8/D9 command and DAC tape position at each replay flush since the
+	-- applied load (not the request: the previous replay can still finish).
+	type flush_t is record
+		tape : natural;
+		cmd  : std_logic_vector(95 downto 0);
+	end record;
+	type flushlog_t is array (0 to 3) of flush_t;
+	signal flush_log  : flushlog_t;
+	signal flush_n    : natural := 0;
+	signal flush_load : integer := -1;
 	-- Last fall of the core's SLEEP (CPU, video and DAC resume together).
 	signal rel_t     : time := 0 ns;
 
@@ -2118,17 +2117,20 @@ begin
 
 	fl_mon : process(clk)
 		alias rp_flush is << signal .tb_cd.DUT.CD.REPLAY_START : std_logic >>;
-		alias rp_cons  is << signal .tb_cd.DUT.CD.SCSI.RP_CONS : unsigned(31 downto 0) >>;
-		variable d : std_logic := '0';
+		alias ssload is << signal .tb_cd.DUT.CD.SCSI.SaveStateBus_load : std_logic >>;
+		variable prev_send : std_logic := '0';
 	begin
 		if rising_edge(clk) then
-			if rp_flush = '1' and d = '0' then
-				flush_log(flush_n mod 8) <= slog_count;
-				flush_cons(flush_n mod 8) <= to_integer(rp_cons);
+			if ssload = '1' then
+				flush_load <= tb_load_count;
+				flush_n <= 0;
+			elsif rp_flush = '1' and cd_comm_send = '1' and prev_send = '0' then
+				if flush_n < flush_log'length then
+					flush_log(flush_n) <= (slog_count, cd_comm);
+				end if;
 				flush_n <= flush_n + 1;
-				flush_mark <= slog_count;
 			end if;
-			d := rp_flush;
+			prev_send := cd_comm_send;
 		end if;
 	end process;
 
@@ -2894,6 +2896,96 @@ begin
 						& time'image(stime(idx) - t_ld) & ", which includes the modelled "
 						& integer'image(G_PLAY_LAT_MS) & " ms seek" severity failure;
 			end procedure;
+			procedure check_music(tag : string; consumed : integer; t_ld : time) is
+				constant frame : natural := consumed mod LOOP_SAMPLES;
+				constant last_dac : natural := dac_of(LOOP_SAMPLES - 1);
+				-- In the first sector the drive already has the original loop target.
+				constant repair : boolean := G_D9_MODE = 1 and frame >= 588;
+				procedure check_flush(n : natural; phase : string; op : std_logic_vector(7 downto 0);
+				                      mode, lba : natural) is
+					variable cmd : std_logic_vector(95 downto 0);
+					variable addr : natural;
+				begin
+					assert flush_n > n
+						report "TBCD " & tag & " FAILED: missing " & phase & " " & to_hstring(op)
+							& " to LBA " & integer'image(lba) & " for saved frame " & integer'image(frame)
+							& " (saw " & integer'image(flush_n) & " command/flush events since load)"
+						severity failure;
+					cmd := flush_log(n).cmd;
+					addr := to_integer(unsigned(cmd(31 downto 24)) & unsigned(cmd(39 downto 32))
+					                   & unsigned(cmd(47 downto 40)));
+					assert cmd(7 downto 0) = op and unsigned(cmd(15 downto 8)) = mode
+					   and cmd(79 downto 78) = "00" and addr = lba
+						report "TBCD " & tag & " FAILED: expected " & phase & " " & to_hstring(op)
+							& " mode " & integer'image(mode) & " to LBA " & integer'image(lba)
+							& ", saw CDB " & to_hstring(cmd) & " (LBA field " & integer'image(addr) & ")"
+						severity failure;
+				end procedure;
+				procedure check_run(phase : string; anchor, start_dac : natural; first : out integer) is
+					variable matched, best : natural := 0;
+					variable best_at : natural := anchor;
+				begin
+					assert slog_count >= anchor + 32
+						report "TBCD " & tag & " FAILED: only " & integer'image(slog_count - anchor)
+							& " DAC changes after the " & phase & " flush; need 32" severity failure;
+					-- Every tape change is audible, even between the corrective D8 and D9.
+					-- Search only the first 64 entries after the flush, never a later lap.
+					for i in anchor to minimum(anchor + 64, slog_count - 32) loop
+						matched := 0;
+						for k in 0 to 31 loop
+							exit when slog(i + k) /= (start_dac + k) mod (last_dac + 1);
+							matched := k + 1;
+						end loop;
+						if matched = 32 then first := i; return; end if;
+						if matched > best then best := matched; best_at := i; end if;
+					end loop;
+					if flush_n = 4 and best_at + best >= flush_log(2).tape
+					   and best_at + best < flush_log(3).tape then
+						report "TBCD " & tag & ": mismatching DAC change is between the corrective D8 and D9";
+					end if;
+					assert false report "TBCD " & tag & " FAILED: " & phase & " matched " & integer'image(best)
+						& "/32 consecutive DAC values from tape " & integer'image(best_at)
+						& " (flush " & integer'image(anchor) & ", saved frame " & integer'image(frame)
+						& "); tape " & integer'image(best_at + best) & " expected "
+						& integer'image((start_dac + best) mod (last_dac + 1)) & ", got "
+						& integer'image(slog(best_at + best)) severity failure;
+				end procedure;
+				variable first, restart, werr : integer;
+			begin
+				assert flush_load = tb_load_count
+					report "TBCD " & tag & " FAILED: load request never applied to SCSI" severity failure;
+				check_flush(0, "resume", x"D8", 0, TRACK_LBA + frame / 588);
+				check_flush(1, "resume", x"D9", G_D9_MODE, TRACK_END);
+				if repair then
+					check_flush(2, "corrective", x"D8", 0, TRACK_LBA);
+					check_flush(3, "corrective", x"D9", G_D9_MODE, TRACK_END);
+				end if;
+				assert flush_n = 2 or (repair and flush_n = 4)
+					report "TBCD " & tag & " FAILED: unexpected extra replay flush(es), "
+						& integer'image(flush_n) & " total for saved frame " & integer'image(frame)
+					severity failure;
+				assert slog_count > flush_log(1).tape + 64
+					report "TBCD " & tag & " FAILED: insufficient DAC output after the resume D9" severity failure;
+				check_run("resume", flush_log(1).tape, dac_of(frame), first);
+				check_sync(tag, first);
+				check_seek(tag, first, t_ld);
+				if repair then
+					check_run("wrap", flush_log(3).tape, dac_of(0), restart);
+					assert flush_log(2).tape > first
+						report "TBCD " & tag & " FAILED: corrective D8 preceded resumed audio" severity failure;
+					-- Measure the cut before D8, not at D9 after a possibly stale FIFO tail.
+					werr := last_dac - slog(flush_log(2).tape - 1);
+					assert abs(werr) <= 1200
+						report "TBCD " & tag & " FAILED: corrective D8 cut the DAC " & integer'image(werr)
+							& " values from the window end" severity failure;
+					report "TBCD " & tag & ": wrap-fix verified (D8 cut at tape "
+						& integer'image(flush_log(2).tape) & ", " & integer'image(werr)
+						& " values before the end; D9 restart at tape " & integer'image(restart) & ")";
+				end if;
+				report "TBCD: scenario " & tag & " PASSED (resume at " & integer'image(frame)
+					& ", stream started " & integer'image(first - flush_log(1).tape)
+					& " samples from the flush; 0 = sample-exact)";
+			end procedure;
 			-- scenario H watches the CPU's own "transfer finished" signal: the
 			-- routine at $FD00 clears $180B only after it has taken the STATUS
 			alias dma_en_hw is << signal .tb_cd.DUT.CD.ADPCM_DMA_EN : std_logic >>;
@@ -2936,13 +3028,6 @@ begin
 			variable still   : integer := 0;
 			variable v       : std_logic_vector(63 downto 0);
 			variable cons_a  : integer;
-			variable anchor  : integer;
-			variable werr    : integer;
-			variable nf      : integer;
-			variable wrapa   : integer;
-			variable fl_tmp  : flushlog_t;
-			variable fl_swp  : integer;
-			variable wrapc   : integer;
 			variable cons_g  : integer;
 			variable t_ld    : time;	-- end of the last load walk
 			variable mark    : integer;
@@ -3845,144 +3930,12 @@ begin
 			report "TBCD B: consumed at save = " & integer'image(cons_a);
 			wait for 1 ms;						-- music diverges live
 
-			mark := slog_count;
 			do_ss(3, true, "B load mid-music");
 			t_ld := now;
 			-- Allow settle, command gaps, FIFO drain and the later wrap pair.
 			-- Search from this load's resume flush, not the stale pre-load tail.
 			wait for 140 ms;
-			assert slog_count > mark + 64
-				report "TBCD B FAILED: no samples after load (replay dead?)" severity failure;
-
-			-- Anchor the search at the replay's last CDDA flush: the resumed
-			-- stream starts THERE, so the expected value must appear right
-			-- away.  Scanning the whole tape instead proves nothing once the
-			-- loop window is shorter than the post-load stream - the track
-			-- comes back round to any value on its own.  The tolerance is far
-			-- below one sector (588 samples) so a resume that is off by even a
-			-- single sector cannot slip through.
-			assert flush_mark > mark
-				report "TBCD B FAILED: the replay never flushed the CDDA stream"
-				severity failure;
-			-- Each silent-D8/D9 pair flushes twice: resume = second flush,
-			-- wrap = fourth. Filter by latched RP_CONS so a previous load's
-			-- late LF_ARM wrap pair cannot shift this load's anchor.
-			nf := 0;
-			wrapa := -1;
-			anchor := flush_mark;
-			for i in 0 to 7 loop
-				fl_tmp(i) := -1;
-			end loop;
-			for i in 0 to 7 loop
-				if flush_log(i) > mark and flush_log(i) /= -1
-				   and flush_cons(i) = cons_a then
-					fl_tmp(nf) := flush_log(i);
-					nf := nf + 1;
-				end if;
-			end loop;
-			-- flush_log is a ring without order: sort the collected ones
-			for i in 0 to 6 loop
-				for j in 0 to 6 - i loop
-					if fl_tmp(j) > fl_tmp(j+1) and fl_tmp(j+1) /= -1 then
-						fl_swp := fl_tmp(j); fl_tmp(j) := fl_tmp(j+1); fl_tmp(j+1) := fl_swp;
-					end if;
-				end loop;
-			end loop;
-			report "TBCD B: flushes for this load (RP_CONS=" & integer'image(cons_a)
-				& "): nf=" & integer'image(nf)
-				& " [" & integer'image(fl_tmp(0)) & " " & integer'image(fl_tmp(1))
-				& " " & integer'image(fl_tmp(2)) & " " & integer'image(fl_tmp(3)) & "]";
-			assert nf >= 2
-				report "TBCD B FAILED: this load produced " & integer'image(nf)
-					& " replay flush(es), so there is no resume pair to anchor on"
-				severity failure;
-			anchor := fl_tmp(1);
-			wrapc := -1;
-			if nf >= 4 then
-				wrapa := fl_tmp(3);	-- post-wrap stream starts here (after the LF D9)
-				wrapc := fl_tmp(2);	-- the LF D8 flush = where the fix CUT the stream
-			end if;
-			exp := cons_a mod LOOP_SAMPLES;
-			-- Diagnostic before judging: print what the resumed stream ACTUALLY
-			-- starts with, and where the expected value really lands relative to
-			-- the flush.  A distance of one sector (588) means the replay
-			-- resumed a sector off; a small distance means the sub-sector sample
-			-- skip is out; a huge one means the position is unrelated.
-			idx := -1;
-			for i in anchor to slog_count - 1 loop
-				if slog(i) = dac_of(exp) then idx := i; exit; end if;
-			end loop;
-			report "TBCD B: flush at tape index " & integer'image(anchor)
-				& ", exp=" & integer'image(exp)
-				& " (dac " & integer'image(dac_of(exp)) & ")"
-				& ", first exp at " & integer'image(idx)
-				& " (offset " & integer'image(idx - anchor) & ")"
-				& ", stream starts: "
-				& integer'image(slog(anchor)) & " "
-				& integer'image(slog(anchor+1)) & " "
-				& integer'image(slog(anchor+2)) & " "
-				& integer'image(slog(anchor+3)) & " "
-				& integer'image(slog(anchor+4)) & " "
-				& integer'image(slog(anchor+5)) & " "
-				& integer'image(slog(anchor+6)) & " "
-				& integer'image(slog(anchor+7));
-			got := -1;
-			for i in anchor to minimum(anchor + 64, slog_count - 33) loop
-				if slog(i) = dac_of(exp) then
-					got := i;
-					for k in 1 to 31 loop
-						if slog(i + k) /= (slog(i) + k) mod (dac_of(LOOP_SAMPLES - 1) + 1) then
-							got := -1;
-							exit;
-						end if;
-					end loop;
-					exit when got >= 0;
-				end if;
-			end loop;
-			assert got >= 0
-				report "TBCD B FAILED: the resumed stream does not start at "
-					& integer'image(exp) & " (searched the 64 samples from the replay "
-					& "flush at tape index " & integer'image(anchor) & ")"
-					severity failure;
-			check_sync("B", got);
-			check_seek("B", got, t_ld);
-			-- Report offset from the resume anchor; zero means sample-exact.
-			-- flush_mark may already point to the later wrap pair.
-			report "TBCD: scenario B PASSED (resume at " & integer'image(exp)
-				& ", stream started " & integer'image(idx - anchor)
-				& " samples from the flush; 0 = sample-exact)";
-			-- The wrap pair must restart at the loop start and cut the resumed
-			-- stream within ~2 sectors of the window end.
-			if wrapa > 0 then
-				got := -1;
-				for i in wrapa to minimum(wrapa + 64, slog_count - 33) loop
-					if slog(i) = dac_of(0) then
-						got := i;
-						for k in 1 to 31 loop
-							if slog(i + k) /= (slog(i) + k) mod (dac_of(LOOP_SAMPLES - 1) + 1) then
-								got := -1;
-								exit;
-							end if;
-						end loop;
-						exit when got >= 0;
-					end if;
-				end loop;
-				assert got >= 0
-					report "TBCD B FAILED: the wrap-fix stream does not restart at the loop start"
-					severity failure;
-				-- precision: the sample just before the LF-D8 flush is where
-				-- the healthy resumed stream was cut - it must sit within ~2
-				-- sectors of the window end (samples between the fix's two
-				-- flushes are an unphased tail: never measure there).  Both terms
-				-- are in DAC units so the fader's scaling cancels.
-				werr := dac_of(LOOP_SAMPLES - 1) - slog(wrapc - 1);
-				assert werr <= 1200 and werr >= -1200
-					report "TBCD B FAILED: the wrap-fix fired " & integer'image(werr)
-						& " samples away from the window end"
-					severity failure;
-				report "TBCD B: wrap-fix verified (restart at the loop start, "
-					& integer'image(werr) & " samples before the end)";
-			end if;
+			check_music("B", cons_a, t_ld);
 
 			end if;	-- G_DO_B
 
@@ -4013,135 +3966,10 @@ begin
 				severity failure;
 			wait for 1 ms;
 
-			mark := slog_count;
 			do_ss(3, true, "G load after wrap");
 			t_ld := now;
 			wait for 140 ms;	-- include the wrap pair
-			assert slog_count > mark + 64
-				report "TBCD G FAILED: no samples after load (replay dead?)" severity failure;
-
-			assert flush_mark > mark
-				report "TBCD G FAILED: the replay never flushed the CDDA stream"
-				severity failure;
-			-- As in B, filter by RP_CONS: a previous load's late wrap pair can
-			-- fall after the mark and shift an ordinal-only anchor by two.
-			nf := 0;
-			wrapa := -1;
-			anchor := flush_mark;
-			for i in 0 to 7 loop
-				fl_tmp(i) := -1;
-			end loop;
-			for i in 0 to 7 loop
-				if flush_log(i) > mark and flush_log(i) /= -1
-				   and flush_cons(i) = cons_g then
-					fl_tmp(nf) := flush_log(i);
-					nf := nf + 1;
-				end if;
-			end loop;
-			-- flush_log is a ring without order: sort the collected ones
-			for i in 0 to 6 loop
-				for j in 0 to 6 - i loop
-					if fl_tmp(j) > fl_tmp(j+1) and fl_tmp(j+1) /= -1 then
-						fl_swp := fl_tmp(j); fl_tmp(j) := fl_tmp(j+1); fl_tmp(j+1) := fl_swp;
-					end if;
-				end loop;
-			end loop;
-			report "TBCD G: flushes for this load (RP_CONS=" & integer'image(cons_g)
-				& "): nf=" & integer'image(nf)
-				& " [" & integer'image(fl_tmp(0)) & " " & integer'image(fl_tmp(1))
-				& " " & integer'image(fl_tmp(2)) & " " & integer'image(fl_tmp(3)) & "]";
-			assert nf >= 2
-				report "TBCD G FAILED: this load produced " & integer'image(nf)
-					& " replay flush(es), so there is no resume pair to anchor on"
-				severity failure;
-			anchor := fl_tmp(1);
-			wrapc := -1;
-			if nf >= 4 then
-				wrapa := fl_tmp(3);	-- post-wrap stream starts here (after the LF D9)
-				wrapc := fl_tmp(2);	-- the LF D8 flush = where the fix CUT the stream
-			end if;
-			exp := cons_g mod LOOP_SAMPLES;
-			-- Diagnostic before judging: print what the resumed stream ACTUALLY
-			-- starts with, and where the expected value really lands relative to
-			-- the flush.  A distance of one sector (588) means the replay
-			-- resumed a sector off; a small distance means the sub-sector sample
-			-- skip is out; a huge one means the position is unrelated.
-			idx := -1;
-			for i in anchor to slog_count - 1 loop
-				if slog(i) = dac_of(exp) then idx := i; exit; end if;
-			end loop;
-			report "TBCD G: flush at tape index " & integer'image(anchor)
-				& ", exp=" & integer'image(exp)
-				& " (dac " & integer'image(dac_of(exp)) & ")"
-				& ", first exp at " & integer'image(idx)
-				& " (offset " & integer'image(idx - anchor) & ")"
-				& ", stream starts: "
-				& integer'image(slog(anchor)) & " "
-				& integer'image(slog(anchor+1)) & " "
-				& integer'image(slog(anchor+2)) & " "
-				& integer'image(slog(anchor+3)) & " "
-				& integer'image(slog(anchor+4)) & " "
-				& integer'image(slog(anchor+5)) & " "
-				& integer'image(slog(anchor+6)) & " "
-				& integer'image(slog(anchor+7));
-			got := -1;
-			for i in anchor to minimum(anchor + 64, slog_count - 33) loop
-				if slog(i) = dac_of(exp) then
-					got := i;
-					for k in 1 to 31 loop
-						if slog(i + k) /= (slog(i) + k) mod (dac_of(LOOP_SAMPLES - 1) + 1) then
-							got := -1;
-							exit;
-						end if;
-					end loop;
-					exit when got >= 0;
-				end if;
-			end loop;
-			assert got >= 0
-				report "TBCD G FAILED: the resumed stream does not start at "
-					& integer'image(exp) & " -- the loop fold-back put the track back "
-					& "in the wrong place (flush at tape index "
-					& integer'image(anchor) & ")"
-					severity failure;
-			check_sync("G", got);
-			check_seek("G", got, t_ld);
-			-- Same anchoring as B: measure from the resume flush, not from
-			-- flush_mark, which the wrap-fix's later pair may have moved.
-			report "TBCD: scenario G PASSED (loop-wrapped resume at " & integer'image(exp)
-				& ", stream started " & integer'image(idx - anchor)
-				& " samples from the flush; 0 = sample-exact)";
-			-- The wrap pair must restart at the loop start and cut the resumed
-			-- stream within ~2 sectors of the window end.
-			if wrapa > 0 then
-				got := -1;
-				for i in wrapa to minimum(wrapa + 64, slog_count - 33) loop
-					if slog(i) = dac_of(0) then
-						got := i;
-						for k in 1 to 31 loop
-							if slog(i + k) /= (slog(i) + k) mod (dac_of(LOOP_SAMPLES - 1) + 1) then
-								got := -1;
-								exit;
-							end if;
-						end loop;
-						exit when got >= 0;
-					end if;
-				end loop;
-				assert got >= 0
-					report "TBCD G FAILED: the wrap-fix stream does not restart at the loop start"
-					severity failure;
-				-- precision: the sample just before the LF-D8 flush is where
-				-- the healthy resumed stream was cut - it must sit within ~2
-				-- sectors of the window end (samples between the fix's two
-				-- flushes are an unphased tail: never measure there).  Both terms
-				-- are in DAC units so the fader's scaling cancels.
-				werr := dac_of(LOOP_SAMPLES - 1) - slog(wrapc - 1);
-				assert werr <= 1200 and werr >= -1200
-					report "TBCD G FAILED: the wrap-fix fired " & integer'image(werr)
-						& " samples away from the window end"
-					severity failure;
-				report "TBCD G: wrap-fix verified (restart at the loop start, "
-					& integer'image(werr) & " samples before the end)";
-			end if;
+			check_music("G", cons_g, t_ld);
 
 			end if;  -- G_DO_G
 
