@@ -160,7 +160,11 @@ parameter CONF_STR = {
 	"Save to state 3,",
 	"Restore state 3,",
 	"Save to state 4,",
-	"Restore state 4;",
+	"Restore state 4,",
+	"Save failed - slot 1,",
+	"Save failed - slot 2,",
+	"Save failed - slot 3,",
+	"Save failed - slot 4;",
 	"J1,Button I,Button II,Select,Run,Button III,Button IV,Button V,Button VI,Savestates;",
 	"jn,A,B,Select,Start,X,Y,L,R;",
 	"jp,A,B,Select,Start,L,R,Y,X;",
@@ -306,7 +310,7 @@ wire  [1:0] ss_slot;
 wire  [7:0] ss_info;
 wire        ss_save, ss_load, ss_info_req;
 wire        ss_statusUpdate;
-wire        ss_busy, ss_failed;
+wire        ss_busy, ss_failed, ss_ram_error;
 wire  [1:0] ss_active_slot;
 wire        ss_active_load;
 
@@ -340,6 +344,7 @@ savestate_ui savestate_ui
 	.ss_info        (ss_info       ),
 	.ss_busy        (ss_busy       ),
 	.ss_failed      (ss_failed     ),
+	.ss_ram_error   (ss_ram_error  ),
 	.ss_active_slot (ss_active_slot),
 	.ss_active_load (ss_active_load),
 	.statusUpdate   (ss_statusUpdate),
@@ -393,6 +398,7 @@ pce_top #(.LITE(LITE)) pce_top
 	.SS_SLOT(ss_slot),
 	.SS_BUSY(ss_busy),
 	.SS_FAILED(ss_failed),
+	.SS_RAM_ERROR(ss_ram_error),
 	.SS_ACTIVE_SLOT(ss_active_slot),
 	.SS_ACTIVE_LOAD(ss_active_load),
 	.SS_SLEEP(ss_sleep),

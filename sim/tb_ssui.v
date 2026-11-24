@@ -6,7 +6,7 @@ reg         clk = 0;
 reg  [10:0] ps2_key = 0;
 reg         allow_ss = 1;
 reg         joySS = 0, joyRight = 0, joyLeft = 0, joyDown = 0, joyUp = 0;
-reg         ss_busy = 0, ss_failed = 0, ss_active_load = 0;
+reg         ss_busy = 0, ss_failed = 0, ss_ram_error = 0, ss_active_load = 0;
 reg   [1:0] ss_active_slot = 0;
 reg   [1:0] status_slot = 0;
 reg   [1:0] OSD_saveload = 0;
@@ -18,7 +18,7 @@ savestate_ui #(.INFO_TIMEOUT_BITS(8)) uut (
   .clk(clk), .ps2_key(ps2_key), .allow_ss(allow_ss),
   .joySS(joySS), .joyRight(joyRight), .joyLeft(joyLeft),
   .joyDown(joyDown), .joyUp(joyUp),
-  .ss_busy(ss_busy), .ss_failed(ss_failed),
+  .ss_busy(ss_busy), .ss_failed(ss_failed), .ss_ram_error(ss_ram_error),
   .ss_active_slot(ss_active_slot), .ss_active_load(ss_active_load),
   .status_slot(status_slot), .OSD_saveload(OSD_saveload),
   .ss_save(ss_save), .ss_load(ss_load),
@@ -162,12 +162,50 @@ initial begin
   if (infos != before_infos + 1 || last_info != 13)
     $fatal(1, "completion reported the wrong operation or slot");
 
+  // A reset-aborted save has no RAM timeout and must remain silent.
+  before_infos = infos;
   ss_busy = 1; ss_failed = 0;
   repeat (4) @(negedge clk);
   ss_failed = 1; ss_busy = 0;
-  before_infos = infos;
   repeat (4) @(negedge clk);
-  if (infos != before_infos) $fatal(1, "failed operation announced success");
+  if (infos != before_infos) $fatal(1, "reset-only save failure announced");
+
+  // Slot 2 is saving when the user queues a load of slot 4.
+  allow_ss = 1; status_slot = 1;
+  repeat (4) @(negedge clk);
+  expect_slot(1, "save slot 2");
+  ss_active_slot = 1; ss_active_load = 0; ss_failed = 0; ss_busy = 1;
+  repeat (4) @(negedge clk);
+  expect_key(8'h0C, 1, 0, 1);
+  expect_key(8'h0C, 0, 0, 0);
+  expect_slot(3, "queued slot 4");
+  @(negedge clk);
+  ss_active_slot = 3; ss_active_load = 1;
+  before_infos = infos;
+  ss_ram_error = 1;
+  repeat (300) @(negedge clk);
+  if (infos != before_infos + 1 || last_info !== 8'd19)
+    $fatal(1, "stalled save: expected one 'Save failed - slot 2', got %0d requests, ID %0d", infos-before_infos, last_info);
+  ss_ram_error = 0; ss_failed = 1; ss_busy = 0;
+  repeat (4) @(negedge clk);
+  if (infos != before_infos + 1) $fatal(1, "drained save error announced again");
+
+  // The queued load hits the same physical fault, but has no save notification.
+  before_infos = infos;
+  ss_failed = 0; ss_busy = 1;
+  repeat (4) @(negedge clk);
+  ss_ram_error = 1;
+  repeat (8) @(negedge clk);
+  ss_ram_error = 0; ss_failed = 1; ss_busy = 0;
+  repeat (4) @(negedge clk);
+  if (infos != before_infos) $fatal(1, "load timeout announced");
+
+  ss_active_load = 0; ss_failed = 0; ss_busy = 1;
+  repeat (4) @(negedge clk);
+  ss_busy = 0;
+  repeat (4) @(negedge clk);
+  if (infos != before_infos + 1 || last_info !== 8'd16)
+    $fatal(1, "save after timeout did not report normal slot 4 success");
 
   if (errors == 0) $display("TB_SSUI PASS");
   else $fatal(1, "TB_SSUI FAIL count=%0d", errors);
