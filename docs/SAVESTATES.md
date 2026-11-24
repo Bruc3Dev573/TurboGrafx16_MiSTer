@@ -124,9 +124,10 @@ Arcade RAM share the external memory port (SDRAM or DDR-backed).
 `rtl/ss_external_ram.vhd` drives it byte by byte while frozen. If the port is
 not ready on the 256th wait clock, the engine fails the operation instead of
 consuming the byte. It withdraws the request and keeps the port until any
-outstanding access drains. A save that times out leaves the slot header invalid. A
-failed restore resets the console before releasing it: reset does not undo
-RAM writes already made. If the hardware never drains, reload the core.
+outstanding access drains. A save that times out leaves the slot header invalid.
+The OSD reports the failed save and the affected slot without waiting for the port
+to recover. A failed restore resets the console before releasing it. Reset does
+not undo RAM writes already made. If the hardware never drains, reload the core.
 The slot itself uses a separate 64-bit DDR3 channel outside the ROM cache.
 After a stopped reference clock restarts, the SDRAM controller waits for
 refresh recovery before issuing ACTIVE. At 85.9 MHz this takes six clocks.

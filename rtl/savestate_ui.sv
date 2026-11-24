@@ -16,6 +16,7 @@ module savestate_ui #(parameter INFO_TIMEOUT_BITS)
 	output reg [7:0] ss_info,
 	input            ss_busy,
 	input            ss_failed,
+	input            ss_ram_error,
 	input      [1:0] ss_active_slot,
 	input            ss_active_load,
 	output reg       statusUpdate,
@@ -37,6 +38,8 @@ reg [1:0]  lastOSDsetting = 2'b0;
 reg        busy_d       = 1'b0;
 reg        req_was_load = 1'b0;
 reg [1:0]  completed_slot = 0;
+reg        ram_error_seen = 1'b0;
+reg        report_save_error = 1'b0;
 
 assign selected_slot = ss_base;
 
@@ -131,13 +134,25 @@ always @(posedge clk) begin
 
 	end
 	// Capture the dispatched operation, not input queued while it runs.
-	// Report successful completion even if commands have since been inhibited.
+	// Report the result even if commands have since been inhibited.
 	busy_d <= ss_busy;
 	if (ss_busy & ~busy_d) begin
 		req_was_load <= ss_active_load;
 		completed_slot <= ss_active_slot;
+		ram_error_seen <= 1'b0;
 	end
-	if (busy_d & ~ss_busy & ~ss_failed) begin
+	report_save_error <= 1'b0;
+	if (busy_d && ss_ram_error && !ram_error_seen) begin
+		ram_error_seen <= 1'b1;
+		if (!req_was_load) begin
+			// hps_io needs a rising edge even if a slot/help notice just fired.
+			ss_info_req <= 1'b0;
+			report_save_error <= 1'b1;
+		end
+	end else if (report_save_error) begin
+		ss_info     <= 7'd18 + completed_slot;
+		ss_info_req <= 1'b1;
+	end else if (busy_d & ~ss_busy & ~ss_failed & ~ram_error_seen) begin
 		ss_info     <= 7'd10 + {completed_slot, req_was_load};
 		ss_info_req <= 1'b1;
 	end

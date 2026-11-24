@@ -91,6 +91,7 @@ entity pce_top is
 		SS_SLOT		: in  std_logic_vector(1 downto 0) := "00";
 		SS_BUSY		: out std_logic;
 		SS_FAILED	: out std_logic;					-- no UI success for a failed or reset-superseded operation
+		SS_RAM_ERROR : out std_logic;
 		SS_ACTIVE_SLOT : out std_logic_vector(1 downto 0);
 		SS_ACTIVE_LOAD : out std_logic := '0';
 		SS_SLEEP		: out std_logic;								-- core frozen (for top-level muxes)
@@ -324,7 +325,7 @@ signal ss_cdr_wr         : std_logic;
 signal ss_cdr_kick       : std_logic;
 signal SS_Dout_AC        : std_logic_vector(63 downto 0);
 signal ss_ram_rdy        : std_logic;
-signal ss_ram_error      : std_logic;
+signal ss_ram_error_i    : std_logic;
 signal VRAM0_QB          : std_logic_vector(15 downto 0);
 signal VRAM1_QB          : std_logic_vector(15 downto 0);
 signal WRAM_QB           : std_logic_vector(7 downto 0);
@@ -969,7 +970,7 @@ port map (
 	region => Save_RAMType, walk_addr => Save_RAMAddr,
 	walk_wr => Save_RAMWrEn, walk_data => Save_RAMWriteData,
 	walk_q => ss_cdr_data, walk_ready => ss_ram_rdy, active => ss_cdr_act,
-	walk_error => ss_ram_error,
+	walk_error => ss_ram_error_i,
 	ram_addr => ss_cdr_addr, ram_data => ss_cdr_wdata, ram_q => CD_RAM_DI,
 	ram_ready => ROM_RDY, ram_rd => ss_cdr_rd, ram_wr => ss_cdr_wr,
 	kick => ss_cdr_kick
@@ -1009,6 +1010,7 @@ PSG_SL <= signed(PCE_SL(23 downto 8));
 SS_SLEEP <= ss_walk_sleep;
 SS_BUSY  <= ss_busy_i;
 SS_FAILED <= ss_save_failed;
+SS_RAM_ERROR <= ss_ram_error_i;
 SS_ACTIVE_SLOT <= std_logic_vector(to_unsigned(ss_request_slot, 2));
 process(CLK) begin
 	if rising_edge(CLK) then
@@ -1140,7 +1142,7 @@ port map (
 	Save_RAMWriteData     => Save_RAMWriteData,
 	Save_RAMReadData      => Save_RAMReadData,
 	Save_RAMRdy           => ss_ram_rdy,
-	Save_RAMError         => ss_ram_error,
+	Save_RAMError         => ss_ram_error_i,
 	Save_RAMType          => Save_RAMType,
 	bus_out_Din           => SS_DDR_DIN,
 	bus_out_Dout          => SS_DDR_DOUT,
